@@ -7,7 +7,7 @@
 //! generated for `1..=workspace_names.len()` -- so this page's row set
 //! tracks the Workspaces page's row count.
 
-use icedtea_config::KeyCombo;
+use icedtea_registry_schema::KeyCombo;
 use icedtea_ui::view::View;
 use icedtea_ui::view::builders::{BoxExt, box_, scrolled_window};
 use icedtea_ui::widgets::Orientation;
@@ -81,7 +81,7 @@ pub fn view(m: &SettingsModel) -> View<Msg> {
 
 /// The fixed part of the action set -- always present regardless of
 /// workspace count. Kept in the same order the compositor's own defaults
-/// insert them (`icedtea_config::defaults::default_config`) purely so the
+/// insert them (`icedtea_registry_schema::defaults::default_config`) purely so the
 /// row order is stable/predictable, not because order carries meaning here.
 pub const FIXED_ACTIONS: [&str; 10] = [
     "close",
@@ -109,7 +109,7 @@ pub const SNAP_RESTORE: &str = "snap:restore";
 /// A conflicting combo is stored like any other. Conflicts are advisory
 /// styling only and never block Apply.
 pub fn apply_capture(
-    cfg: &mut icedtea_config::Config,
+    cfg: &mut icedtea_registry_schema::Config,
     action: &str,
     keysym: u32,
     mods: CaptureMods,
@@ -194,7 +194,7 @@ pub fn format_combo(combo: &KeyCombo) -> String {
 /// and fall back to the modified one **only** when the keycode produces no base
 /// sym at all (`XKB_KEY_NoSymbol`, which is 0).
 ///
-/// This is required because `icedtea_config::keys::key_name_to_keysym` always
+/// This is required because `icedtea_registry_schema::keys::key_name_to_keysym` always
 /// encodes the unshifted keysym (`"KEY_q"` -> `0x71`), so a capture that stored
 /// `0x51` (`XK_Q`) from a `SUPER+SHIFT+q` press would produce a binding
 /// `match_action` can never fire.
@@ -218,7 +218,7 @@ pub fn normalise_keysym(base: u32, modified: u32) -> u32 {
 ///
 /// The keysym is resolved exactly the way `compositor/src/input.rs:109-123`
 /// matches: the raw, level-0 sym, falling back to the modified one only
-/// when the keycode produces no base sym at all. `icedtea_config::keys::
+/// when the keycode produces no base sym at all. `icedtea_registry_schema::keys::
 /// key_name_to_keysym` always encodes the unshifted keysym (`"KEY_q"` ->
 /// `0x71`), so a capture that stored `0x51` (`XK_Q`) from a `SUPER+SHIFT+q`
 /// press would produce a binding the compositor can never fire.
@@ -273,7 +273,7 @@ mod tests {
         // for `1..=workspace_names.len()`). So this only checks that every
         // action for the actual default workspace count is covered, not
         // that every pre-bound key shows up as a row.
-        let cfg = icedtea_config::default_config();
+        let cfg = icedtea_registry_schema::default_config();
         let actions = action_list(cfg.workspace_names.len());
         for n in 1..=cfg.workspace_names.len() {
             let ws = format!("workspace:{n}");
@@ -325,7 +325,7 @@ mod tests {
     fn normalise_keysym_prefers_the_base_sym() {
         // SUPER+SHIFT+q: GDK/xkb report the modified sym XK_Q (0x51); the
         // compositor only ever matches the unshifted XK_q (0x71), because
-        // `icedtea_config::keys::key_name_to_keysym("KEY_q")` encodes 0x71.
+        // `icedtea_registry_schema::keys::key_name_to_keysym("KEY_q")` encodes 0x71.
         assert_eq!(normalise_keysym(0x71, 0x51), 0x71);
     }
 
@@ -505,7 +505,7 @@ mod tests {
     /// Mutation check: return `false` unconditionally; this fails. Restore.
     #[test]
     fn apply_capture_stores_the_combo_and_reports_done() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         let stored = apply_capture(
             &mut cfg,
             "close",
@@ -531,7 +531,7 @@ mod tests {
     /// `true` on `None`; the `still_armed` assertion fails. Restore.
     #[test]
     fn a_lone_modifier_leaves_the_capture_armed() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         let before = cfg.keybindings.clone();
         let stored = apply_capture(
             &mut cfg,
@@ -554,7 +554,7 @@ mod tests {
     /// `duplicate_bindings` would grow; this fails. Restore.
     #[test]
     fn apply_capture_allows_a_conflicting_binding() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         assert!(apply_capture(
             &mut cfg,
             "close",
@@ -590,7 +590,7 @@ mod tests {
         write_binding_line(
             &path,
             "close",
-            &icedtea_config::KeyCombo {
+            &icedtea_registry_schema::KeyCombo {
                 modifiers: vec!["SUPER".to_string(), "SHIFT".to_string()],
                 key: "KEY_q".to_string(),
             },
@@ -599,7 +599,7 @@ mod tests {
         write_binding_line(
             &path,
             "reload",
-            &icedtea_config::KeyCombo {
+            &icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_F5".to_string(),
             },
@@ -628,7 +628,7 @@ mod tests {
         write_binding_line(
             &path,
             "close",
-            &icedtea_config::KeyCombo {
+            &icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_a".to_string(),
             },
@@ -647,13 +647,11 @@ mod tests {
     /// A `SettingsModel` on a throwaway db, with `workspace_names` set so
     /// `action_list`'s generated rows are predictable.
     fn model_with_workspaces(count: usize) -> crate::app::SettingsModel {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("config.redb");
         // `handles_for_test`, never the real `ipc::spawn`: that one opens a
         // `ConfigReloaded` subscription on the developer's live session bus
         // (finding 15). Nothing here issues a `Cmd::Task`.
         let (workers, _rx, _portal_rx, _fs_rx) = crate::ipc::handles_for_test();
-        let mut m = crate::app::SettingsModel::new(db_path, workers);
+        let mut m = crate::app::SettingsModel::new(crate::app::tests::direct_registry(), workers);
         m.model.working.workspace_names = (1..=count).map(|n| n.to_string()).collect();
         m
     }
@@ -718,7 +716,7 @@ mod tests {
         let mut m = model_with_workspaces(1);
         m.model.working.keybindings.insert(
             "close".to_string(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec!["SUPER".to_string()],
                 key: "KEY_q".to_string(),
             },
@@ -766,7 +764,7 @@ mod tests {
     #[test]
     fn a_conflicting_row_carries_the_conflict_class() {
         let mut m = model_with_workspaces(1);
-        let combo = icedtea_config::KeyCombo {
+        let combo = icedtea_registry_schema::KeyCombo {
             modifiers: vec![],
             key: "KEY_a".to_string(),
         };
@@ -954,7 +952,7 @@ mod tests {
         let mut m = model_with_workspaces(1);
         m.model.working.keybindings.insert(
             "quit".to_string(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_a".to_string(),
             },

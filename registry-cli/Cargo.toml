@@ -1,0 +1,15 @@
+[package]
+name = "icedtea-registry-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "registry"
+path = "src/main.rs"
+
+[dependencies]
+icedtea-registry = { path = "../registry" }
+icedtea-registry-schema = { path = "../registry-schema" }
+serde.workspace = true
+serde_json.workspace = true

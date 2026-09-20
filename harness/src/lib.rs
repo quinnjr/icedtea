@@ -424,8 +424,10 @@ impl Compositor {
             // `state` is declared after `display`/`runtime`/`backend` so that
             // ordinary end-of-scope drop order drops it first: `attach` hands
             // it a `Runtime` clone, which must not outlive the `Display`.
-            let mut state =
-                icedtea_compositor::state::State::new(icedtea_config::default_config(), event_tx);
+            let mut state = icedtea_compositor::state::State::new(
+                icedtea_registry_schema::default_config(),
+                event_tx,
+            );
             state.wayland.attach(runtime.clone());
 
             // Same "harness cannot degrade" tone as the globals above, and

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["contract", "config", "compositor", "clipboard", "harness", "shell", "settings", "notifications", "ui", "session"]
+members = ["contract", "compositor", "clipboard", "harness", "shell", "settings", "notifications", "ui", "session", "registry", "registry-schema", "registryd", "registry-cli"]
 
 [workspace.package]
 version = "0.1.0"

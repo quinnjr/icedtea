@@ -6,11 +6,8 @@
 //! own key-event modifier state into [`CaptureMods`] and calls into this
 //! module, so the logic here can be unit-tested without one.
 
-use std::path::Path;
-
-use icedtea_config::{
-    Config, KeyCombo, MODIFIER_TOKENS, keysym_to_key_name, load_or_default, open,
-};
+use icedtea_registry::Registry;
+use icedtea_registry_schema::{Config, KeyCombo, MODIFIER_TOKENS, keysym_to_key_name};
 
 /// The working-copy state the settings UI edits: `working` is what the
 /// widgets are bound to, `saved` is a snapshot of what's actually on disk
@@ -23,11 +20,11 @@ pub struct Model {
 }
 
 impl Model {
-    /// Load `db_path` (falling back to defaults per
-    /// `icedtea_config::load_or_default`) into a fresh working copy whose
-    /// `saved` snapshot matches, so a freshly-loaded `Model` is never dirty.
-    pub fn load(db_path: &Path) -> Self {
-        let cfg = load_or_default(db_path);
+    /// Load the registry (falling back to schema defaults when it is
+    /// unreachable) into a fresh working copy whose `saved` snapshot matches,
+    /// so a freshly-loaded `Model` is never dirty.
+    pub fn load(registry: &Registry) -> Self {
+        let cfg = Config::load_or_default(registry);
         Self {
             working: cfg.clone(),
             saved: cfg,
@@ -40,10 +37,10 @@ impl Model {
         self.working != self.saved
     }
 
-    /// Discard any unsaved edits: reload `db_path` into both `working` and
+    /// Discard any unsaved edits: reload the registry into both `working` and
     /// `saved`, so `is_dirty()` is `false` immediately after.
-    pub fn revert(&mut self, db_path: &Path) {
-        let cfg = load_or_default(db_path);
+    pub fn revert(&mut self, registry: &Registry) {
+        let cfg = Config::load_or_default(registry);
         self.working = cfg.clone();
         self.saved = cfg;
     }
@@ -53,7 +50,7 @@ impl Model {
 /// `saved = working` (this function only writes -- it doesn't own `Model`,
 /// so it can't do that itself).
 ///
-/// The store is opened through [`icedtea_config::open`] (not
+/// The store is opened through [`icedtea_registry_schema::connect`] (not
 /// `redb::Database::create` directly) so its `catch_unwind` guard + parent
 /// `create_dir_all` apply: a corrupt config file returns `Err` here ("Failed
 /// to save") instead of tripping an internal redb `assert!` and panicking the
@@ -70,12 +67,11 @@ impl Model {
 /// persisted displays authoritative we reload the current on-disk `displays`
 /// immediately before saving and write those, leaving every other section to
 /// the caller's edits.
-pub fn apply(cfg: &Config, db_path: &Path) -> Result<(), redb::Error> {
-    let on_disk = load_or_default(db_path);
+pub fn apply(cfg: &Config, registry: &Registry) -> Result<(), String> {
+    let on_disk = Config::load_or_default(registry);
     let mut cfg = cfg.clone();
     cfg.displays = on_disk.displays;
-    let db = open(db_path)?;
-    cfg.save(&db)
+    cfg.save(registry)
 }
 
 /// Toolkit-free stand-in for a raw key-event modifier mask -- the
@@ -98,7 +94,7 @@ pub struct CaptureMods {
 ///
 /// This checks the *name* `keysym_to_key_name` resolves to (rather than
 /// depending on `xkbcommon` directly for its keysym constants) so this
-/// module stays within the `icedtea_config` surface the plan calls out
+/// module stays within the `icedtea_registry_schema` surface the plan calls out
 /// (`keysym_to_key_name`, `MODIFIER_TOKENS`) instead of picking up a second,
 /// independent way to talk about keysyms.
 fn is_bare_modifier(key_name: &str) -> bool {
@@ -130,7 +126,7 @@ fn is_bare_modifier(key_name: &str) -> bool {
 
 /// Translate a captured keysym + modifier state into a `KeyCombo`, in the
 /// exact serialization the compositor's matcher expects (see
-/// `icedtea_config::keys`): `modifiers` uses the `MODIFIER_TOKENS` spelling,
+/// `icedtea_registry_schema::keys`): `modifiers` uses the `MODIFIER_TOKENS` spelling,
 /// `key` is `keysym_to_key_name(keysym)`.
 ///
 /// Returns `None` when `keysym` itself names a bare modifier key (see
@@ -274,11 +270,17 @@ pub fn validate_wallpaper(text: &str) -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_config::{Behavior, KeyCombo, key_name_to_keysym};
-    use tempfile::tempdir;
+    use icedtea_registry_schema::{Behavior, KeyCombo, key_name_to_keysym};
+
+    /// A hermetic registry: in-memory store, no bus, no file.
+    fn direct() -> Registry {
+        let store = icedtea_registry::Store::in_memory(icedtea_registry_schema::schema())
+            .expect("in-memory store");
+        Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
+    }
 
     fn non_default_config() -> Config {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.bar_position = "bottom".to_string();
         cfg.behavior = Behavior {
             raise_on_focus: !cfg.behavior.raise_on_focus,
@@ -298,12 +300,11 @@ mod tests {
 
     #[test]
     fn save_then_load_round_trips() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("settings-cfg.redb");
+        let registry = direct();
         let cfg = non_default_config();
 
-        apply(&cfg, &path).unwrap();
-        let loaded = load_or_default(&path);
+        apply(&cfg, &registry).unwrap();
+        let loaded = Config::load(&registry).unwrap();
 
         assert_eq!(loaded, cfg);
     }
@@ -385,7 +386,7 @@ mod tests {
 
     #[test]
     fn duplicate_bindings_finds_a_planted_conflict() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         let shared = KeyCombo {
             modifiers: vec!["SUPER".to_string()],
             key: "KEY_z".to_string(),
@@ -408,7 +409,7 @@ mod tests {
 
     #[test]
     fn duplicate_bindings_is_empty_for_defaults() {
-        let cfg = icedtea_config::default_config();
+        let cfg = icedtea_registry_schema::default_config();
         assert!(
             duplicate_bindings(&cfg).is_empty(),
             "default keybindings must not collide"
@@ -421,7 +422,7 @@ mod tests {
         // these two bindings fire the same combo and MUST be reported as a
         // conflict even though their modifier order (and thus derived
         // `PartialEq`) differs.
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.keybindings.insert(
             "a".to_string(),
             KeyCombo {
@@ -474,10 +475,9 @@ mod tests {
     /// though the caller's working copy carried a stale (empty) `displays`.
     #[test]
     fn apply_preserves_on_disk_displays() {
-        use icedtea_config::DisplayConfig;
+        use icedtea_registry_schema::DisplayConfig;
 
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("displays-cfg.redb");
+        let registry = direct();
 
         // The compositor persisted a layout on its side.
         let persisted = vec![DisplayConfig {
@@ -494,24 +494,21 @@ mod tests {
         // The compositor persists displays through its own `Config::save`, not
         // through `model::apply` (which never writes displays), so seed the
         // store that way.
-        let mut on_disk = icedtea_config::default_config();
+        let mut on_disk = icedtea_registry_schema::default_config();
         on_disk.displays = persisted.clone();
-        {
-            let db = open(&path).unwrap();
-            on_disk.save(&db).unwrap();
-        }
+        on_disk.save(&registry).unwrap();
 
         // The settings app loaded its Config at startup, then edits a
         // non-display field. Simulate a *stale* working copy whose displays no
         // longer match disk (here: empty, as a fresh default would be).
-        let mut working = icedtea_config::default_config();
+        let mut working = icedtea_registry_schema::default_config();
         working.displays.clear();
         working.appearance.palette.accent = "#ff00aa".to_string();
-        apply(&working, &path).unwrap();
+        apply(&working, &registry).unwrap();
 
         // The non-display edit landed, but the compositor-owned displays are
         // intact -- not overwritten by the working copy's stale empty list.
-        let reloaded = load_or_default(&path);
+        let reloaded = Config::load(&registry).unwrap();
         assert_eq!(reloaded.appearance.palette.accent, "#ff00aa");
         assert_eq!(
             reloaded.displays, persisted,
@@ -521,24 +518,23 @@ mod tests {
 
     #[test]
     fn model_dirty_tracking_and_revert() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("model-cfg.redb");
-        let cfg = icedtea_config::default_config();
-        apply(&cfg, &path).unwrap();
+        let registry = direct();
+        let cfg = icedtea_registry_schema::default_config();
+        apply(&cfg, &registry).unwrap();
 
-        let mut model = Model::load(&path);
+        let mut model = Model::load(&registry);
         assert!(!model.is_dirty());
 
         model.working.behavior.snap_enabled = !model.working.behavior.snap_enabled;
         assert!(model.is_dirty());
 
-        apply(&model.working, &path).unwrap();
+        apply(&model.working, &registry).unwrap();
         model.saved = model.working.clone();
         assert!(!model.is_dirty());
 
         model.working.behavior.raise_on_focus = !model.working.behavior.raise_on_focus;
         assert!(model.is_dirty());
-        model.revert(&path);
+        model.revert(&registry);
         assert!(!model.is_dirty());
         assert_eq!(model.working, model.saved);
     }

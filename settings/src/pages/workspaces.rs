@@ -1,6 +1,6 @@
 //! The Workspaces page: an editable list of workspace names.
 //!
-//! `workspace_names` must never go empty -- `icedtea_config::load_or_default`
+//! `workspace_names` must never go empty -- `Config::load_or_default`
 //! rejects an empty list on load, so an empty working copy would silently
 //! revert to defaults on next start. Remove must therefore stay a no-op
 //! whenever exactly one row remains.
@@ -9,7 +9,7 @@
 //! pair per workspace, so adding/removing a row here changes the *set* of
 //! actions that page shows.
 
-use icedtea_config::Config;
+use icedtea_registry_schema::Config;
 use icedtea_ui::layout::Align;
 use icedtea_ui::view::View;
 use icedtea_ui::view::builders::{BoxExt, box_, list_box, list_box_row};
@@ -128,7 +128,7 @@ pub fn next_workspace_name(existing: &[String]) -> String {
 /// count, any binding beyond the new length is unreachable from the UI --
 /// left in place it would sit in the saved config forever, a keybinding for
 /// a workspace slot that no longer exists.
-pub fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_config::Config) {
+pub fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_registry_schema::Config) {
     let workspace_count = cfg.workspace_names.len();
     cfg.keybindings.retain(|action, _| {
         for prefix in ["workspace:", "move_to_workspace:"] {
@@ -146,7 +146,7 @@ pub fn prune_orphaned_workspace_bindings(cfg: &mut icedtea_config::Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_config::KeyCombo;
+    use icedtea_registry_schema::KeyCombo;
 
     #[test]
     fn next_workspace_name_is_not_len_plus_one_after_a_remove() {
@@ -200,7 +200,7 @@ mod tests {
         // two workspaces must drop the workspace:3 / move_to_workspace:3
         // pair (the row the Keybindings page can no longer show) and keep
         // everything else, including unrelated fixed actions.
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["a".to_string(), "b".to_string()];
         cfg.keybindings
             .insert("workspace:1".to_string(), combo("KEY_1"));
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn prune_orphaned_workspace_bindings_is_a_no_op_when_nothing_is_orphaned() {
-        let cfg_before = icedtea_config::default_config();
+        let cfg_before = icedtea_registry_schema::default_config();
         let mut cfg = cfg_before.clone();
         // default_config's workspace_names.len() is <= its highest
         // pre-bound workspace:N, so nothing here is actually orphaned yet
@@ -256,7 +256,7 @@ mod tests {
         }
     }
 
-    /// The Remove buttons are insensitive at one row: `icedtea_config::
+    /// The Remove buttons are insensitive at one row: `icedtea_registry_schema::
     /// load_or_default` rejects an empty workspace list, so an empty working
     /// copy would silently revert to defaults on the next start. This is the
     /// GTK `set_remove_sensitivity` rule, now computed from the config.
@@ -265,7 +265,7 @@ mod tests {
     /// test fails on the one-name case. Restore.
     #[test]
     fn can_remove_is_false_at_the_last_workspace() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["only".to_string()];
         assert!(
             !can_remove(&cfg),
@@ -283,7 +283,7 @@ mod tests {
     /// the length assertion fails. Restore.
     #[test]
     fn rename_workspace_writes_one_slot() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["a".to_string(), "b".to_string()];
         let bindings_before = cfg.keybindings.clone();
         rename_workspace(&mut cfg, 1, "beta");
@@ -306,7 +306,7 @@ mod tests {
     /// test panics instead of passing. Restore.
     #[test]
     fn rename_workspace_ignores_an_out_of_range_index() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["a".to_string()];
         rename_workspace(&mut cfg, 7, "beta");
         assert_eq!(cfg.workspace_names, vec!["a".to_string()]);
@@ -319,7 +319,7 @@ mod tests {
     /// this test fails with `"3"` instead of `"1"`. Restore.
     #[test]
     fn add_workspace_appends_the_next_free_name() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["2".to_string(), "3".to_string()];
         add_workspace(&mut cfg);
         assert_eq!(
@@ -337,18 +337,18 @@ mod tests {
     /// the `workspace:3` assertion fails. Restore.
     #[test]
     fn remove_workspace_prunes_the_bindings_it_orphans() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         cfg.keybindings.insert(
             "workspace:3".to_string(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_3".to_string(),
             },
         );
         cfg.keybindings.insert(
             "close".to_string(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_q".to_string(),
             },
@@ -375,7 +375,7 @@ mod tests {
     /// fails. Restore.
     #[test]
     fn remove_workspace_refuses_the_last_row_and_a_bad_index() {
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["only".to_string()];
         let before = cfg.clone();
         remove_workspace(&mut cfg, 0);
@@ -398,9 +398,9 @@ mod tests {
     fn the_pure_surface_is_public() {
         let next: fn(&[String]) -> String = crate::pages::workspaces::next_workspace_name;
         assert_eq!(next(&[]), "1");
-        let prune: fn(&mut icedtea_config::Config) =
+        let prune: fn(&mut icedtea_registry_schema::Config) =
             crate::pages::workspaces::prune_orphaned_workspace_bindings;
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         prune(&mut cfg);
         assert!(!cfg.workspace_names.is_empty());
     }
@@ -411,10 +411,8 @@ mod tests {
     /// and nothing else disturbed. Built through the same `SettingsModel::
     /// new` the binary uses, so the view under test sees a real model.
     fn model_with(names: &[&str]) -> crate::app::SettingsModel {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("config.redb");
         let (workers, _rx, _portal_rx, _fs_rx) = crate::ipc::handles_for_test();
-        let mut m = crate::app::SettingsModel::new(db_path, workers);
+        let mut m = crate::app::SettingsModel::new(crate::app::tests::direct_registry(), workers);
         m.model.working.workspace_names = names.iter().map(|s| (*s).to_string()).collect();
         m
     }
@@ -553,7 +551,7 @@ mod tests {
         let mut m = model_with(&["a", "b", "c"]);
         m.model.working.keybindings.insert(
             "workspace:3".to_string(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_3".to_string(),
             },

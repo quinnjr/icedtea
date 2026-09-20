@@ -94,7 +94,7 @@ fn a_headless_compositor_boots_runs_and_stops() {
     // `state.wayland` a `Runtime` clone, and `wlr` documents that a
     // `Runtime` must not outlive the `Display` it was initialized against.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -181,7 +181,7 @@ fn the_shutdown_source_stops_the_loop() {
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     // Raise the real signal at this process: `signal_hook` writes a byte to
@@ -219,7 +219,7 @@ fn a_dbus_command_wakes_an_idle_loop_via_its_wake_pipe() {
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -277,7 +277,7 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     // The reload channel and its wake pipe -- the thing under test.
@@ -302,7 +302,7 @@ fn a_config_reload_wakes_an_idle_loop_via_its_wake_pipe() {
     // "loaded" config, then nudge the wake pipe.
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let mut reloaded = icedtea_config::default_config();
+        let mut reloaded = icedtea_registry_schema::default_config();
         reloaded.workspace_names = vec!["alpha".into(), "beta".into(), "gamma".into()];
         let _ = reload_tx.send(reloaded);
         icedtea_compositor::backend::wake(&reload_wake_write);
@@ -370,7 +370,7 @@ fn wallpaper_decode_wake_pipe_survives_the_worker_thread_exiting() {
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     // The wallpaper wake pipe, wired exactly like `run()` wires it.
@@ -458,7 +458,7 @@ fn an_ssd_window_with_no_live_toplevel_never_gets_a_rect() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.create_output(
         0,
         icedtea_contract::Rectangle {
@@ -512,7 +512,7 @@ fn a_toplevel_becomes_a_model_window_and_releases_it_on_destroy() {
     use icedtea_compositor::wayland::ToplevelKey;
 
     let (tx, rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.create_output(
         0,
         icedtea_contract::Rectangle {
@@ -607,7 +607,7 @@ fn closing_distinguishes_a_real_client_from_a_model_only_window() {
     use icedtea_compositor::wayland::ToplevelKey;
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.create_output(
         0,
         icedtea_contract::Rectangle {
@@ -710,7 +710,7 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
     use icedtea_compositor::wayland::ToplevelKey;
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.create_output(
         0,
         icedtea_contract::Rectangle {
@@ -777,7 +777,7 @@ fn a_press_on_an_unfocused_window_moves_focus_at_both_ends() {
 #[test]
 fn a_bound_key_is_consumed_and_an_unbound_one_is_forwarded() {
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
 
     // `SUPER+SHIFT+q` is the default `quit` binding, and 0x71 is the
     // *unshifted* keysym for q -- which is exactly why the library reports
@@ -792,7 +792,7 @@ fn a_bound_key_is_consumed_and_an_unbound_one_is_forwarded() {
     assert!(state.quitting, "and it fired");
 
     let (tx2, _rx2) = crossbeam_channel::unbounded();
-    let mut state2 = State::new(icedtea_config::default_config(), tx2);
+    let mut state2 = State::new(icedtea_registry_schema::default_config(), tx2);
     assert_eq!(
         state2.handle_key(icedtea_compositor::input::Modifiers::empty(), 0x61),
         None,
@@ -903,7 +903,7 @@ fn unmapping_the_focused_window_reroutes_the_seat_without_panicking() {
     use wlr::ToplevelHandler;
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.create_output(
         0,
         icedtea_contract::Rectangle {
@@ -973,7 +973,7 @@ fn a_decoded_wallpaper_gets_one_buffer_node_per_output() {
     // See `a_headless_compositor_boots_runs_and_stops` for why `state` is
     // declared after `display`/`backend`/`runtime`.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -1053,7 +1053,7 @@ fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime);
 
     assert!(state.snap_preview_rect().is_none());
@@ -1111,7 +1111,7 @@ fn snap_preview_rect_is_created_and_torn_down_against_a_live_scene() {
 #[test]
 fn migration_centers_an_oversized_window_into_the_survivor_without_panicking() {
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
 
     // The dead output the oversized window is currently on.
     state.create_output(

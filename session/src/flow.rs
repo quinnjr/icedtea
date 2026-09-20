@@ -28,7 +28,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use icedtea_config::Power;
+use icedtea_registry_schema::Power;
 use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::logind::{Logind, LogindEvents, PowerKeyInhibitor, SleepInhibitor};

@@ -402,7 +402,7 @@ mod tests {
         for (index, wanted) in ICEDTEA_DEFAULTS.iter().enumerate() {
             assert_eq!(&hexes[index], wanted, "the shipped defaults lead");
         }
-        let defaults = icedtea_config::default_config().appearance.palette;
+        let defaults = icedtea_registry_schema::default_config().appearance.palette;
         for wanted in [defaults.background, defaults.foreground, defaults.accent] {
             assert_eq!(
                 hexes.iter().filter(|hex| **hex == wanted).count(),

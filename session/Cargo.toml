@@ -6,7 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 icedtea-contract = { path = "../contract" }
-icedtea-config = { path = "../config" }
+icedtea-registry = { path = "../registry" }
+icedtea-registry-schema = { path = "../registry-schema" }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 zbus.workspace = true

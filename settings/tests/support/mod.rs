@@ -94,6 +94,7 @@ pub fn spawn_settings_process(comp: &icedtea_harness::Compositor) -> SettingsPro
         .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
         .env("XDG_CONFIG_HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path())
+        .env("ICEDTEA_REGISTRY_DB", registry_db_path(dir.path()))
         .env("ICEDTEA_PROBE_REPORT", &report)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
@@ -259,18 +260,40 @@ pub struct ProbePoint {
     pub y: i32,
 }
 
-/// A temp `XDG_CONFIG_HOME` holding a config `edit` has had its way with.
-///
-/// `icedtea_config::default_db_path` reads `XDG_CONFIG_HOME`, so pointing the
-/// child at this directory is all the isolation a gate needs — no new env knob.
+/// The registry file a child opened with `config_home` will use. Spawning
+/// helpers point `$ICEDTEA_REGISTRY_DB` here so the child never talks to
+/// whatever registry daemon happens to be running on the developer's bus.
 #[must_use]
-pub fn seeded_config_dir(edit: impl FnOnce(&mut icedtea_config::Config)) -> tempfile::TempDir {
+pub fn registry_db_path(config_home: &Path) -> std::path::PathBuf {
+    config_home.join("icedtea").join("registry.redb")
+}
+
+/// A hermetic in-process registry over an in-memory store: no bus, no file.
+#[must_use]
+pub fn in_memory_registry() -> icedtea_registry::Registry {
+    let store = icedtea_registry::Store::in_memory(icedtea_registry_schema::schema())
+        .expect("in-memory store");
+    icedtea_registry::Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
+}
+
+/// A temp `XDG_CONFIG_HOME` holding a registry `edit` has had its way with.
+///
+/// The child is pointed at [`registry_db_path`] via `$ICEDTEA_REGISTRY_DB`, so
+/// this directory is all the isolation a gate needs.
+#[must_use]
+pub fn seeded_config_dir(
+    edit: impl FnOnce(&mut icedtea_registry_schema::Config),
+) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("config dir");
-    let db = dir.path().join("icedtea").join("config.redb");
+    let db = registry_db_path(dir.path());
     std::fs::create_dir_all(db.parent().expect("parent")).expect("create the config dir");
-    let mut cfg = icedtea_config::default_config();
+    let store = icedtea_registry::Store::open(&db, icedtea_registry_schema::schema())
+        .expect("open the seeded registry");
+    let registry =
+        icedtea_registry::Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)));
+    let mut cfg = icedtea_registry_schema::default_config();
     edit(&mut cfg);
-    icedtea_settings::model::apply(&cfg, &db).expect("seed the config db");
+    cfg.save(&registry).expect("seed the registry");
     dir
 }
 
@@ -331,6 +354,7 @@ pub fn spawn_settings(
             .env("WAYLAND_DISPLAY", socket)
             .env("XDG_RUNTIME_DIR", icedtea_harness::runtime_dir())
             .env("XDG_CONFIG_HOME", config_home)
+            .env("ICEDTEA_REGISTRY_DB", registry_db_path(config_home))
             .env("ICEDTEA_SETTINGS_PAGE", page)
             .env("ICEDTEA_PROBE_REPORT", report)
             .stdout(Stdio::null())

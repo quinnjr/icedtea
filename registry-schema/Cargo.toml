@@ -1,0 +1,17 @@
+[package]
+name = "icedtea-registry-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+icedtea-contract = { path = "../contract" }
+icedtea-registry = { path = "../registry" }
+serde.workspace = true
+serde_json.workspace = true
+redb.workspace = true
+tracing.workspace = true
+xkbcommon = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

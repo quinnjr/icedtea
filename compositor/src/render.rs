@@ -13,7 +13,8 @@
 
 use std::os::unix::net::UnixStream;
 
-use icedtea_contract::{Appearance, Rectangle};
+use icedtea_contract::Rectangle;
+use icedtea_registry_schema::Appearance;
 
 use crate::decoration;
 use crate::window::Window;

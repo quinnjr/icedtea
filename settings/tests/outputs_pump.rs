@@ -55,10 +55,9 @@ fn the_initial_enumeration_reaches_the_model_when_the_loop_is_seeded() {
         .expect("attach")
         .expect("the harness advertises zwlr_output_manager_v1");
 
-    let dir = tempfile::tempdir().expect("tempdir");
     let (workers, _rx, _portal_rx, _fs_rx) = icedtea_settings::ipc::handles_for_test();
     let mut model =
-        icedtea_settings::app::SettingsModel::new(dir.path().join("config.redb"), workers)
+        icedtea_settings::app::SettingsModel::new(support::in_memory_registry(), workers)
             .with_outputs(Some(pump.clone()));
 
     // `manager_present()`, not `is_some()` — the harness has the global, so
@@ -115,10 +114,9 @@ fn a_dead_connection_latches_the_pump_and_unwatches_the_fd() {
         "a latched pump never dispatches, warns or re-emits Disconnected again"
     );
 
-    let dir = tempfile::tempdir().expect("tempdir");
     let (workers, _rx, _portal_rx, _fs_rx) = icedtea_settings::ipc::handles_for_test();
     let mut model =
-        icedtea_settings::app::SettingsModel::new(dir.path().join("config.redb"), workers)
+        icedtea_settings::app::SettingsModel::new(support::in_memory_registry(), workers)
             .with_outputs(Some(pump.clone()));
     let cmd = icedtea_settings::app::update(&mut model, disconnected);
     assert!(

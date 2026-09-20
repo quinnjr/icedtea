@@ -20,7 +20,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use icedtea_config::{TileGroup, default_tile_size};
+use icedtea_registry_schema::{TileGroup, default_tile_size};
 
 /// Desktop name this launcher shows up as for `OnlyShowIn`/`NotShowIn`.
 // SYNC: mirrored in compositor/src/state.rs; launcher_parity test is the sync gate.
@@ -348,7 +348,7 @@ impl PinStore {
 
 /// Named tile groups (ordered) with ordered member ids.
 ///
-/// The group shape is `icedtea_config::TileGroup` (single owner: the config
+/// The group shape is `icedtea_registry_schema::TileGroup` (single owner: the config
 /// crate persists it, this core operates on it).
 #[derive(Debug, Default, Clone)]
 pub struct TileStore {

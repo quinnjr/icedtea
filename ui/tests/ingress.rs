@@ -1045,7 +1045,7 @@ const KEY_LEFTSHIFT: u32 = 42;
 #[test]
 fn base_keysym_reports_the_level_zero_sym_for_a_shifted_key() {
     // Settings' keybinding capture stores the *unshifted* sym, because
-    // `icedtea_config::keys::key_name_to_keysym` always encodes that one;
+    // `icedtea_registry_schema::keys::key_name_to_keysym` always encodes that one;
     // storing XK_A from SUPER+SHIFT+a would produce a binding the compositor
     // can never match (M5-D7's normalisation rule).
     // mutation: change the level argument from 0 to 1 in `base_keysym`; the

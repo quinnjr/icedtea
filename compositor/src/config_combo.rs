@@ -1,1 +1,1 @@
-pub use icedtea_config::KeyCombo;
+pub use icedtea_registry_schema::KeyCombo;

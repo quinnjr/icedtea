@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 icedtea-compositor = { path = "../compositor" }
-icedtea-config = { path = "../config" }
+icedtea-registry-schema = { path = "../registry-schema" }
 icedtea-contract = { path = "../contract" }
 wlr = "0.20.33"
 wayland-client = "0.31"

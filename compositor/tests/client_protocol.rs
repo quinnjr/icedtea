@@ -1836,7 +1836,7 @@ fn screencopy_captures_the_output() {
 ///
 /// Expected and actual share one config source: `Compositor::spawn` (harness
 /// boot, `harness/src/lib.rs`) constructs its `State` from
-/// `icedtea_config::default_config()`, exactly the same call used below to
+/// `icedtea_registry_schema::default_config()`, exactly the same call used below to
 /// derive the expected color, so this assertion can never be vacuously right.
 #[test]
 fn screencopy_of_empty_output_is_the_wallpaper_color() {
@@ -1866,8 +1866,9 @@ fn screencopy_of_empty_output_is_the_wallpaper_color() {
         }
     };
 
-    let [r, g, b, _a] =
-        icedtea_compositor::render::wallpaper_color(&icedtea_config::default_config().appearance);
+    let [r, g, b, _a] = icedtea_compositor::render::wallpaper_color(
+        &icedtea_registry_schema::default_config().appearance,
+    );
     let expect = |c: f32| (c * 255.0).round() as i32;
     let (er, eg, eb) = (expect(r), expect(g), expect(b));
 

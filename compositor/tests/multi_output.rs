@@ -15,6 +15,14 @@ use icedtea_compositor::state::State;
 // must be in scope to call it on `State`.
 use wlr::OutputHandler;
 
+/// A direct (no-bus) registry over a temp store, so the off-loop display
+/// persist never touches the real registry.
+fn direct_registry(path: &std::path::Path) -> icedtea_registry::Registry {
+    let store = icedtea_registry::Store::open(path, icedtea_registry_schema::schema())
+        .expect("open the test registry");
+    icedtea_registry::Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
+}
+
 /// Cursor-stimulus hotspot the damage test moves the software cursor to, in
 /// output-logical coordinates (mirrors the `wlr` crate's own
 /// `output_feedback.rs` stimulus).
@@ -91,7 +99,7 @@ fn a_second_headless_output_is_tracked_with_a_layout_box() {
     // `Runtime` clone, and `wlr` documents that a `Runtime` must not outlive
     // the `Display` it was initialized against.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -179,7 +187,7 @@ fn sync_wallpaper_nodes_removes_a_node_for_an_output_that_is_gone() {
     // `state` is declared (and so dropped) after `display`/`backend`/`runtime`
     // for the same reason as every other test in this file.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -288,13 +296,13 @@ fn a_disabled_output_can_be_re_enabled_within_a_session() {
 
     // Declared (dropped) after display/backend/runtime, as every test here.
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
-    // Isolate the off-loop redb persist `output_configuration_applied` kicks
-    // off; without this it would write to the real XDG database path.
+    // Isolate the off-loop persist `output_configuration_applied` kicks off;
+    // without this it would write to the real registry path.
     let tmp = std::env::temp_dir().join(format!("icedtea-disp-{}.redb", std::process::id()));
-    state.config_path = Some(tmp.clone());
+    state.registry = Some(direct_registry(&tmp));
 
     let background = runtime
         .add_rect(
@@ -399,7 +407,7 @@ fn output_commit_and_precommit_are_observed_per_output() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -494,12 +502,12 @@ fn disabling_every_output_keeps_at_least_one_active() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
-    // Isolate the off-loop redb persist from the real XDG database path.
+    // Isolate the off-loop persist from the real registry path.
     let tmp = std::env::temp_dir().join(format!("icedtea-lastout-{}.redb", std::process::id()));
-    state.config_path = Some(tmp.clone());
+    state.registry = Some(direct_registry(&tmp));
 
     let background = runtime
         .add_rect(
@@ -552,17 +560,20 @@ fn disabling_every_output_keeps_at_least_one_active() {
     // 0x0 mode; persisting that would flip the record to disabled and wipe the
     // saved mode -- which the next boot would then force-enable at preferred,
     // losing everything.
-    state.config.displays.push(icedtea_config::DisplayConfig {
-        name: name_b.clone(),
-        enabled: true,
-        width: 2560,
-        height: 1440,
-        refresh_mhz: 144_000,
-        x: 100,
-        y: 0,
-        scale: 1.5,
-        transform: 3,
-    });
+    state
+        .config
+        .displays
+        .push(icedtea_registry_schema::DisplayConfig {
+            name: name_b.clone(),
+            enabled: true,
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 144_000,
+            x: 100,
+            y: 0,
+            scale: 1.5,
+            transform: 3,
+        });
 
     // Disable the last remaining one, alone: the guard must refuse it so the
     // session is never left with zero active outputs.
@@ -640,7 +651,7 @@ fn output_commit_order_precommit_precedes_commit() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -780,7 +791,7 @@ fn output_damage_roundtrip_frame_commits_after_damage() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -937,7 +948,7 @@ fn output_request_state_roundtrip_records_staged_mask() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -1071,7 +1082,7 @@ fn output_power_cycle_disables_then_reenables() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime
@@ -1185,7 +1196,7 @@ fn commit_and_damage_logs_stay_bounded_over_a_long_run() {
     drop(boot);
 
     let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut state = State::new(icedtea_config::default_config(), tx);
+    let mut state = State::new(icedtea_registry_schema::default_config(), tx);
     state.wayland.attach(runtime.clone());
 
     let background = runtime

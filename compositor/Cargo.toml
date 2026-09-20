@@ -14,10 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 icedtea-contract = { path = "../contract" }
-icedtea-config = { path = "../config" }
+icedtea-registry = { path = "../registry" }
+icedtea-registry-schema = { path = "../registry-schema" }
 # NOTE (review finding M3): `serde`, `serde_json`, and `redb` used to be
 # declared here with no reference anywhere in `compositor/src` -- config
-# persistence is entirely the `icedtea-config` crate's job. Dropped.
+# persistence is entirely the registry's job. Dropped.
 tracing.workspace = true
 tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true

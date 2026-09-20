@@ -1,0 +1,29 @@
+[Unit]
+Description=icedtea registry broker (configuration and registration store)
+Documentation=https://github.com/quinnjr/icedtea-wm
+PartOf=graphical-session.target
+After=graphical-session.target
+# The sole opener of registry.redb. Consumers (compositor, shell, session,
+# notifications, settings) talk to it over org.icedtea.Registry; if it is not
+# up yet they fall back to opening the store directly, which would then
+# conflict with this daemon's handle. Start it first so that fallback is only
+# ever the genuine "daemon is not running" case.
+Before=icedtea-shell.service icedtea-session.service icedtea-notifications.service icedtea-clipboard.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/icedtea-registryd
+# on-failure (not always): a bus-name conflict with an already-running broker
+# makes the daemon exit *cleanly* (code 0) rather than crash, so on-failure
+# deliberately does not respawn it into a crash-loop. A genuine fault (exit 1)
+# is still retried.
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=graphical-session.target

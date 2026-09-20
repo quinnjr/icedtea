@@ -432,7 +432,7 @@ impl Settings {
 /// the SHIP-BLOCKER shift-normalisation fix through GDK's own keymap. This
 /// proves the same property through the real toolkit, the real compositor
 /// and a real `zwp_virtual_keyboard_v1` press: capturing `Shift`+`a` must
-/// store the *unshifted* `KEY_a`, because `icedtea_config::keys::
+/// store the *unshifted* `KEY_a`, because `icedtea_registry_schema::keys::
 /// key_name_to_keysym` only ever encodes the unshifted keysym and a stored
 /// `KEY_A` is a binding the compositor's `match_action` can never fire.
 ///

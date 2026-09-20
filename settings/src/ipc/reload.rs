@@ -19,8 +19,8 @@ pub enum ReloadRequest {
     /// `Box`ed: a `Config` is a few hundred bytes and `Shutdown` carries
     /// none, so an unboxed variant would make every queued request that size.
     Apply {
-        cfg: Box<icedtea_config::Config>,
-        db_path: std::path::PathBuf,
+        cfg: Box<icedtea_registry_schema::Config>,
+        registry: icedtea_registry::Registry,
     },
     /// Stop, once everything already queued has been served. `ipc::Workers::
     /// shutdown` sends this and waits: an Apply in flight is a `redb` write
@@ -112,12 +112,12 @@ pub fn spawn_worker_on_bus(
         .spawn(move || {
             let client = ReloadClient::on_bus(address.as_deref());
             while let Ok(request) = rx.recv() {
-                let (cfg, db_path) = match request {
+                let (cfg, registry) = match request {
                     ReloadRequest::Shutdown => return,
-                    ReloadRequest::Apply { cfg, db_path } => (*cfg, db_path),
+                    ReloadRequest::Apply { cfg, registry } => (*cfg, registry),
                 };
                 let result =
-                    apply_and_reload(&cfg, &db_path, &client).map_err(|err| err.to_string());
+                    apply_and_reload(&cfg, &registry, &client).map_err(|err| err.to_string());
                 // The snapshot travels back with the answer: `update`
                 // re-baselines `saved` from *this* config, not from whatever
                 // the working copy has become while the write was in flight.

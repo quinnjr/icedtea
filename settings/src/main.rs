@@ -8,7 +8,6 @@
 
 use std::path::Path;
 
-use icedtea_config::default_db_path;
 use icedtea_settings::app::{SettingsModel, update, view};
 use icedtea_settings::ipc;
 use icedtea_settings::outputs::pump::OutputsPump;
@@ -117,8 +116,14 @@ fn main() {
         }
     }
 
-    let mut model =
-        SettingsModel::new(default_db_path(), workers.handles()).with_outputs(pump.clone());
+    // The daemon when reachable, a direct store otherwise (see
+    // `icedtea_registry_schema::connect`).
+    let registry = icedtea_registry_schema::connect().unwrap_or_else(|err| {
+        tracing::error!(%err, "cannot open the registry");
+        std::process::exit(1);
+    });
+
+    let mut model = SettingsModel::new(registry, workers.handles()).with_outputs(pump.clone());
     // The page the window opens on (P2-D8/P4-D9): a debug/test affordance
     // with the same role as `gallery --widget`, letting a rest-state gate
     // photograph one page without synthesising a switcher click. An unknown
