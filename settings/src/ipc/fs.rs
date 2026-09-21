@@ -7,8 +7,7 @@
 //! itself. Both now leave through `Cmd::Task` and come back as a `Msg` on
 //! the inbox, the same shape the reload and portal workers already have.
 
-use std::path::PathBuf;
-
+use icedtea_registry::Registry;
 use icedtea_ui::view::InboxSender;
 
 use crate::app::Msg;
@@ -18,8 +17,8 @@ pub enum FsRequest {
     /// Does this typed-or-portal-supplied path name an image this app can
     /// use? Answered with [`Msg::WallpaperValidated`].
     ValidateWallpaper { text: String },
-    /// Read `db_path` back, for Revert. Answered with [`Msg::ConfigLoaded`].
-    LoadConfig { db_path: PathBuf },
+    /// Read the registry back, for Revert. Answered with [`Msg::ConfigLoaded`].
+    LoadConfig { registry: Registry },
     /// Stop once everything already queued is served.
     Shutdown,
 }
@@ -45,8 +44,8 @@ pub fn spawn(
                         result: crate::model::validate_wallpaper(&text)
                             .map(|path| path.display().to_string()),
                     },
-                    FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(
-                        icedtea_config::load_reportable(&db_path).map(std::sync::Arc::new),
+                    FsRequest::LoadConfig { registry } => Msg::ConfigLoaded(
+                        icedtea_registry_schema::Config::load(&registry).map(std::sync::Arc::new),
                     ),
                 };
                 if tx.send(msg).is_err() {

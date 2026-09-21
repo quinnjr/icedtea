@@ -4,11 +4,11 @@
 //! service absent), that's fine -- the write already landed on disk and
 //! will apply on the compositor's next start.
 
-use std::path::Path;
 use std::time::Duration;
 
-use icedtea_config::Config;
 use icedtea_contract::{COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
+use icedtea_registry::Registry;
+use icedtea_registry_schema::Config;
 
 /// How long [`ReloadClient::on_bus`] waits for a session bus to hand it a
 /// connection.
@@ -127,15 +127,15 @@ fn connect(address: Option<&str>) -> Result<zbus::blocking::Connection, ()> {
         .ok_or(())
 }
 
-/// Persist `cfg` to `db_path` (via [`crate::model::apply`]) then ask the
+/// Persist `cfg` to the registry (via [`crate::model::apply`]) then ask the
 /// compositor to reload. The write is unconditional; the reload is
 /// best-effort and never turns a successful write into an `Err`.
 pub fn apply_and_reload(
     cfg: &Config,
-    db_path: &Path,
+    registry: &Registry,
     client: &ReloadClient,
-) -> Result<ReloadOutcome, redb::Error> {
-    crate::model::apply(cfg, db_path)?;
+) -> Result<ReloadOutcome, String> {
+    crate::model::apply(cfg, registry)?;
     Ok(client.reload())
 }
 

@@ -63,10 +63,14 @@ impl WorkerHandles {
         }
     }
 
-    /// Queue a re-read of the config store. Never blocks: the answer arrives
+    /// Queue a re-read of the registry. Never blocks: the answer arrives
     /// as `Msg::ConfigLoaded` on the inbox.
-    pub fn load_config(&self, db_path: std::path::PathBuf) {
-        if self.fs.send(fs::FsRequest::LoadConfig { db_path }).is_err() {
+    pub fn load_config(&self, registry: icedtea_registry::Registry) {
+        if self
+            .fs
+            .send(fs::FsRequest::LoadConfig { registry })
+            .is_err()
+        {
             tracing::warn!("the filesystem worker is gone; Revert was dropped");
         }
     }
@@ -74,12 +78,16 @@ impl WorkerHandles {
     /// Queue a save+reload. Never blocks: the answer arrives as
     /// `Msg::Applied` on the inbox. A closed channel (the worker died) is
     /// logged once and dropped — the window stays usable.
-    pub fn apply(&self, cfg: icedtea_config::Config, db_path: std::path::PathBuf) {
+    pub fn apply(
+        &self,
+        cfg: icedtea_registry_schema::Config,
+        registry: icedtea_registry::Registry,
+    ) {
         if self
             .reload
             .send(reload::ReloadRequest::Apply {
                 cfg: Box::new(cfg),
-                db_path,
+                registry,
             })
             .is_err()
         {
@@ -259,16 +267,19 @@ mod tests {
     /// and this stops compiling; send `default_config()` instead and the
     /// accent assertion fails. Restore.
     #[test]
-    fn an_apply_reaches_the_worker_with_the_config_and_the_db_path() {
+    fn an_apply_reaches_the_worker_with_the_config_and_the_registry() {
         let (handles, reload_rx, _portal_rx, _fs_rx) = super::handles_for_test();
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.palette.accent = "#ff00aa".to_string();
-        handles.apply(cfg, std::path::PathBuf::from("/tmp/icedtea-test.redb"));
+        handles.apply(cfg, crate::app::tests::direct_registry());
 
         match reload_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(super::reload::ReloadRequest::Apply { cfg, db_path }) => {
+            Ok(super::reload::ReloadRequest::Apply { cfg, registry }) => {
                 assert_eq!(cfg.appearance.palette.accent, "#ff00aa");
-                assert_eq!(db_path, std::path::PathBuf::from("/tmp/icedtea-test.redb"));
+                assert!(
+                    registry.seq().is_ok(),
+                    "the request carries a usable handle"
+                );
             }
             other => panic!("expected an Apply request, got one: {}", other.is_ok()),
         }
@@ -287,8 +298,7 @@ mod tests {
     /// fails. Restore.
     #[test]
     fn the_reload_worker_writes_the_config_and_answers_on_the_inbox() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("config.redb");
+        let registry = crate::app::tests::direct_registry();
         let (inbox, tx) = icedtea_ui::view::Inbox::<crate::app::Msg>::new().expect("inbox");
         let (req_tx, req_rx) = crossbeam_channel::unbounded();
         let worker = super::reload::spawn_worker_on_bus(
@@ -298,12 +308,12 @@ mod tests {
         )
         .expect("the reload worker starts");
 
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.palette.accent = "#ff00aa".to_string();
         req_tx
             .send(super::reload::ReloadRequest::Apply {
                 cfg: Box::new(cfg),
-                db_path: db.clone(),
+                registry: registry.clone(),
             })
             .expect("queue the apply");
 
@@ -320,7 +330,7 @@ mod tests {
             }) => {}
             other => panic!("expected Msg::Applied(Ok(CompositorAbsent)), got {other:?}"),
         }
-        let on_disk = icedtea_config::load_or_default(&db);
+        let on_disk = icedtea_registry_schema::Config::load(&registry).expect("read back");
         assert_eq!(on_disk.appearance.palette.accent, "#ff00aa");
 
         let _ = req_tx.send(super::reload::ReloadRequest::Shutdown);

@@ -102,7 +102,13 @@ fn call_outcome(result: zbus::Result<()>) -> ExitCode {
 /// so this returns `FAILURE` and lets systemd's `Restart=always` recover the
 /// service rather than keep running with a dead lock funnel.
 fn run_daemon() -> ExitCode {
-    let config = icedtea_config::load_or_default(&icedtea_config::default_db_path());
+    let config = match icedtea_registry_schema::connect() {
+        Ok(registry) => icedtea_registry_schema::Config::load_or_default(&registry),
+        Err(err) => {
+            tracing::warn!(%err, "registry unavailable; using the default power policy");
+            icedtea_registry_schema::default_config()
+        }
+    };
     let locker = config.power.locker_command.as_deref().unwrap_or("(none)");
     tracing::info!(locker, "icedtea-session starting");
 

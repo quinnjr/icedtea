@@ -37,7 +37,8 @@ pub enum ColorSlot {
 
 pub struct SettingsModel {
     pub model: crate::model::Model,
-    pub db_path: std::path::PathBuf,
+    /// The registry handle every read/write goes through.
+    pub registry: icedtea_registry::Registry,
     pub page: PageId,
     pub status: String,
     /// What is permanently unavailable because a worker thread could not be
@@ -51,7 +52,7 @@ pub struct SettingsModel {
     /// The action whose binding is being captured, if any (P3 arms it).
     pub capturing: Option<String>,
     /// Conflicting bindings, recomputed from `working` after every edit.
-    pub conflicts: Vec<(icedtea_config::KeyCombo, Vec<String>)>,
+    pub conflicts: Vec<(icedtea_registry_schema::KeyCombo, Vec<String>)>,
     pub wallpaper_text: String,
     pub wallpaper_error: Option<String>,
     pub portal_available: bool,
@@ -73,10 +74,10 @@ pub struct SettingsModel {
 }
 
 impl SettingsModel {
-    /// Load the working copy from `db_path`.
+    /// Load the working copy from the registry.
     #[must_use]
-    pub fn new(db_path: std::path::PathBuf, workers: crate::ipc::WorkerHandles) -> Self {
-        let model = crate::model::Model::load(&db_path);
+    pub fn new(registry: icedtea_registry::Registry, workers: crate::ipc::WorkerHandles) -> Self {
+        let model = crate::model::Model::load(&registry);
         let wallpaper_text = model
             .working
             .appearance
@@ -86,7 +87,7 @@ impl SettingsModel {
         let conflicts = crate::model::duplicate_bindings(&model.working);
         SettingsModel {
             model,
-            db_path,
+            registry,
             page: PageId::Appearance,
             worker_warning: worker_warning(&workers),
             status: String::new(),
@@ -146,14 +147,14 @@ pub enum Msg {
     /// current working copy. An edit folded while the write was in flight
     /// used to be marked saved without ever reaching disk.
     Applied {
-        shipped: std::sync::Arc<icedtea_config::Config>,
+        shipped: std::sync::Arc<icedtea_registry_schema::Config>,
         result: Result<ReloadOutcome, String>,
     },
     /// The filesystem worker's answer to a Revert read of the config store:
     /// `Ok` with the loaded config (or defaults, for a genuinely absent store),
     /// or `Err` with a message when the store is present but unreadable
     /// (corrupt/IO/locked) — in which case the saved copy is kept, not wiped.
-    ConfigLoaded(Result<std::sync::Arc<icedtea_config::Config>, String>),
+    ConfigLoaded(Result<std::sync::Arc<icedtea_registry_schema::Config>, String>),
     /// The compositor emitted `ConfigReloaded`.
     ConfigReloaded,
 
@@ -334,18 +335,20 @@ pub fn update(m: &mut SettingsModel, msg: Msg) -> Cmd<Msg> {
         }
         Msg::Apply => {
             let cfg = m.model.working.clone();
-            let db_path = m.db_path.clone();
+            let registry = m.registry.clone();
             let workers = m.workers.clone();
             m.status = "Applying\u{2026}".to_string();
-            Cmd::Task(Rc::new(move || workers.apply(cfg.clone(), db_path.clone())))
+            Cmd::Task(Rc::new(move || {
+                workers.apply(cfg.clone(), registry.clone())
+            }))
         }
         Msg::Revert => {
-            // Reading the store means opening `redb`, which `update` must not
-            // do on the loop thread (spec D8): the read leaves on the
-            // filesystem worker and comes back as `Msg::ConfigLoaded`.
+            // Reading the registry is a blocking D-Bus call, which `update`
+            // must not make on the loop thread (spec D8): the read leaves on
+            // the filesystem worker and comes back as `Msg::ConfigLoaded`.
             let handles = m.workers.clone();
-            let db_path = m.db_path.clone();
-            Cmd::Task(Rc::new(move || handles.load_config(db_path.clone())))
+            let registry = m.registry.clone();
+            Cmd::Task(Rc::new(move || handles.load_config(registry.clone())))
         }
         Msg::ConfigLoaded(Ok(cfg)) => {
             m.model.working = (*cfg).clone();
@@ -843,13 +846,19 @@ pub(crate) mod tests {
     /// stay valid.
     fn model() -> (SettingsModel, tempfile::TempDir, TestWorkers) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("config.redb");
         let (workers, reload, portal, fs) = crate::ipc::handles_for_test();
         (
-            SettingsModel::new(db, workers),
+            SettingsModel::new(direct_registry(), workers),
             dir,
             TestWorkers { reload, portal, fs },
         )
+    }
+
+    /// A hermetic registry: an in-memory store, no bus, no file.
+    pub(crate) fn direct_registry() -> icedtea_registry::Registry {
+        let store = icedtea_registry::Store::in_memory(icedtea_registry_schema::schema())
+            .expect("in-memory store");
+        icedtea_registry::Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
     }
 
     /// The worker queues a [`test_model`] hands its `Cmd::Task`s to.
@@ -883,8 +892,8 @@ pub(crate) mod tests {
                                 .map(|path| path.display().to_string()),
                         }
                     }
-                    crate::ipc::fs::FsRequest::LoadConfig { db_path } => Msg::ConfigLoaded(
-                        icedtea_config::load_reportable(&db_path).map(std::sync::Arc::new),
+                    crate::ipc::fs::FsRequest::LoadConfig { registry } => Msg::ConfigLoaded(
+                        icedtea_registry_schema::Config::load(&registry).map(std::sync::Arc::new),
                     ),
                 };
                 update(m, msg);
@@ -897,13 +906,13 @@ pub(crate) mod tests {
     /// send fail.
     pub(crate) fn test_model() -> (SettingsModel, TestWorkers) {
         let (workers, reload, portal, fs) = crate::ipc::handles_for_test();
-        let cfg = icedtea_config::default_config();
+        let cfg = icedtea_registry_schema::default_config();
         let model = SettingsModel {
             model: crate::model::Model {
                 working: cfg.clone(),
                 saved: cfg,
             },
-            db_path: std::path::PathBuf::from("/nonexistent/icedtea-test.redb"),
+            registry: direct_registry(),
             page: crate::pages::PageId::Appearance,
             status: String::new(),
             worker_warning: String::new(),
@@ -981,7 +990,10 @@ pub(crate) mod tests {
         assert_eq!(palette.foreground, "#cdd6f4");
         assert_eq!(
             palette.accent,
-            icedtea_config::default_config().appearance.palette.accent,
+            icedtea_registry_schema::default_config()
+                .appearance
+                .palette
+                .accent,
             "the untouched slot is untouched"
         );
     }
@@ -1177,11 +1189,7 @@ pub(crate) mod tests {
     /// again and this fails.
     #[test]
     fn a_worker_that_never_started_is_reported_in_the_footer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut m = SettingsModel::new(
-            dir.path().join("config.redb"),
-            crate::ipc::dead_handles_for_test(),
-        );
+        let mut m = SettingsModel::new(direct_registry(), crate::ipc::dead_handles_for_test());
         assert!(
             footer_text(&m).contains("could not start"),
             "got {:?}",
@@ -1219,11 +1227,7 @@ pub(crate) mod tests {
     fn a_dead_worker_leaves_its_button_insensitive_however_dirty_the_model_is() {
         use icedtea_ui::css::node::PseudoStates;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut m = SettingsModel::new(
-            dir.path().join("config.redb"),
-            crate::ipc::dead_handles_for_test(),
-        );
+        let mut m = SettingsModel::new(direct_registry(), crate::ipc::dead_handles_for_test());
         m.model.working.appearance.palette.accent = "#ff00aa".to_string();
         assert!(m.is_dirty(), "the precondition the buttons key off");
 
@@ -1624,7 +1628,7 @@ pub(crate) mod tests {
     #[test]
     fn each_behavior_switch_writes_its_own_field() {
         let (mut m, _workers) = test_model();
-        let defaults = icedtea_config::default_config().behavior;
+        let defaults = icedtea_registry_schema::default_config().behavior;
 
         update(&mut m, Msg::RaiseOnFocusToggled(!defaults.raise_on_focus));
         assert_eq!(

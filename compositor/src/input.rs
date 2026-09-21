@@ -16,11 +16,11 @@ bitflags::bitflags! {
 }
 
 // `MODIFIER_TOKENS` / `key_name_to_keysym` / `keysym_to_key_name` moved to
-// `icedtea_config::keys` (the shared source of truth for the `KeyCombo`
+// `icedtea_registry_schema::keys` (the shared source of truth for the `KeyCombo`
 // format, also consumed by the settings app); re-exported here so every
 // existing caller (`input::key_name_to_keysym`, etc.) keeps compiling
 // unchanged.
-pub use icedtea_config::{MODIFIER_TOKENS, key_name_to_keysym, keysym_to_key_name};
+pub use icedtea_registry_schema::{MODIFIER_TOKENS, key_name_to_keysym, keysym_to_key_name};
 
 /// Check every configured binding once, returning a human-readable problem
 /// description per unusable binding: an unrecognized modifier token, or a
@@ -498,7 +498,7 @@ mod tests {
     //
     // `key_names_resolve_through_xkb_without_regressing_the_old_table` and
     // `key_name_round_trips_through_keysym_to_key_name` moved to
-    // `icedtea_config::keys::tests` along with the functions they exercise.
+    // `icedtea_registry_schema::keys::tests` along with the functions they exercise.
 
     /// I4: a letter binding that could never fire before now dispatches.
     #[test]

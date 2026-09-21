@@ -13,11 +13,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+
 use std::time::Instant;
 
-use icedtea_config::Config;
 use icedtea_contract::{AltTabState, Event, Rectangle, SeqEvent, WindowId};
+use icedtea_registry::Registry;
+use icedtea_registry_schema::Config;
 // `SeatHandler` for the M7 test-hook arms in `handle_command`, which drive
 // the real touch/gesture notifications (`touch_cancelled`,
 // `gesture_began/ended`) on the loop thread.
@@ -817,12 +818,11 @@ pub struct State {
     /// shell-facing reading where "unknown yet" is expressible -- which is
     /// what `Snapshot.cursor_pos` carries.
     pub cursor_pos: Option<(i32, i32)>,
-    /// On-disk location `reload_config_from_disk`/`handle_command`'s
-    /// `ReloadConfig` worker thread reads from. `None` (the boot-time
-    /// default) means "use `icedtea_config::default_db_path()`" -- this is
-    /// only ever overridden by tests, which need an isolated temp DB rather
-    /// than the real XDG path.
-    pub config_path: Option<PathBuf>,
+    /// The registry handle `reload_config_from_disk` / the `ReloadConfig`
+    /// worker thread read from and `spawn_config_save` writes displays to.
+    /// `None` (tests that never touch config I/O) makes both paths no-ops;
+    /// production sets it from `lib.rs`'s boot `connect()`.
+    pub registry: Option<Registry>,
     /// Directories scanned for `<app_id>.desktop` files by
     /// `handle_command`'s `SpawnApp` arm (the B1 launcher path). The
     /// compositor keeps its OWN index copy -- resolved at spawn time from
@@ -932,17 +932,6 @@ pub struct State {
     /// under the old name-keyed map, so the second insert dropped the first
     /// id and it could never be rehydrated; a unique id key keeps both.
     disabled_outputs: HashMap<wlr::OutputId, String>,
-    /// Serializes every worker-thread redb OPEN (both
-    /// [`Self::spawn_config_save`]'s writer and
-    /// [`Self::spawn_config_reload`]'s reader) so the two never hold a handle
-    /// to the same file at once. redb permits only one `Database` per file
-    /// per process; without this a save racing a reload hits
-    /// `DatabaseAlreadyOpen`, and `load_or_default` then falls back to
-    /// `default_config()` -- silently WIPING the live appearance/keybindings/
-    /// workspaces (or dropping the display write) that were on disk (review
-    /// finding #3). Each worker holds this lock across its whole open + use +
-    /// drop, so the next open never begins until the previous handle is gone.
-    config_db_lock: Arc<Mutex<()>>,
     /// The scene rect painted behind everything, once boot has made one.
     background: Option<wlr::RectId>,
     /// The fd source SIGINT/SIGTERM write to. Compared in `fd_ready` so that
@@ -1559,7 +1548,7 @@ impl State {
             touch_active: false,
             cursor_visible: false,
             cursor_pos: None,
-            config_path: None,
+            registry: None,
             app_dirs: default_app_dirs(),
             config_reload_tx: None,
             config_reload_rx: None,
@@ -1571,7 +1560,6 @@ impl State {
             last_request: HashMap::new(),
             pending_test_action: None,
             disabled_outputs: HashMap::new(),
-            config_db_lock: Arc::new(Mutex::new(())),
             background: None,
             shutdown_source: None,
             cmd_rx: None,
@@ -4031,7 +4019,7 @@ impl State {
     }
 
     /// Synchronously reload the config from `self.config_path` (falling
-    /// back to `icedtea_config::default_db_path()` when unset) and apply it.
+    /// back to `icedtea_registry_schema::default_db_path()` when unset) and apply it.
     /// Returns the events `apply_config` produced (which already includes a
     /// trailing `Event::ConfigReloaded` -- see that method's doc -- so
     /// nothing is pushed again here).
@@ -4058,12 +4046,16 @@ impl State {
     /// sample bugs and document them here). Dropped; `apply_config`'s event
     /// is the one and only `ConfigReloaded` this path emits.
     pub fn reload_config_from_disk(&mut self) -> Vec<Event> {
-        let path = self
-            .config_path
-            .clone()
-            .unwrap_or_else(icedtea_config::default_db_path);
-        let cfg = icedtea_config::load_or_default(&path);
-        self.apply_reloaded_config(cfg)
+        let Some(registry) = self.registry.clone() else {
+            return Vec::new();
+        };
+        match Config::load(&registry) {
+            Ok(cfg) => self.apply_reloaded_config(cfg),
+            Err(err) => {
+                tracing::warn!(%err, "config reload failed; keeping current config");
+                Vec::new()
+            }
+        }
     }
 
     /// Apply a `Config` (already loaded, whether synchronously by
@@ -4135,7 +4127,7 @@ impl State {
     /// triggers -- `handle_command`'s `DbCommand::ReloadConfig` arm and
     /// `apply_action`'s `"reload"` arm (bound to `SUPER+SHIFT+r` by
     /// default). Loads `self.config_path` (falling back to
-    /// `icedtea_config::default_db_path()`) on the worker thread and ships
+    /// `icedtea_registry_schema::default_db_path()`) on the worker thread and ships
     /// the result back over `config_reload_tx`; `drain_config_reload` picks
     /// it up on the next turn once it arrives. A no-op if `config_reload_tx`
     /// hasn't been wired yet (only possible before `set_config_reload_sender`
@@ -4144,10 +4136,9 @@ impl State {
         let Some(tx) = self.config_reload_tx.clone() else {
             return;
         };
-        let path = self
-            .config_path
-            .clone()
-            .unwrap_or_else(icedtea_config::default_db_path);
+        let Some(registry) = self.registry.clone() else {
+            return;
+        };
         // `try_clone` dup(2)s the wake pipe's write half so the worker
         // thread owns a handle it can move across the `'static` bound
         // rather than borrowing `self`'s. `None` (no test wires this, and a
@@ -4159,58 +4150,24 @@ impl State {
             .config_reload_wake
             .as_ref()
             .and_then(|w| w.try_clone().ok());
-        let lock = Arc::clone(&self.config_db_lock);
         std::thread::spawn(move || {
-            // `None` == persistently locked by another handle: send nothing so
-            // the render loop keeps its current `self.config` untouched (review
-            // finding #2), and skip the wake (nothing to drain). Only a real
-            // load result is shipped and woken on.
-            if let Some(cfg) = Self::load_config_locked(&lock, &path) {
-                let _ = tx.send(cfg);
-                if let Some(wake) = wake {
-                    crate::backend::wake(&wake);
+            // A failed load (the registry is unreachable) sends nothing so the
+            // render loop keeps its current `self.config`; only a real result is
+            // shipped and woken on. There is no file lock to retry against — the
+            // daemon serializes writers — so the old `LoadOutcome::Locked`
+            // backoff is gone.
+            match Config::load(&registry) {
+                Ok(cfg) => {
+                    let _ = tx.send(cfg);
+                    if let Some(wake) = wake {
+                        crate::backend::wake(&wake);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "config reload failed; keeping current config");
                 }
             }
         });
-    }
-
-    /// Load the config from `path`, holding `lock` across the whole
-    /// open+read+drop so no concurrent [`Self::save_config_to`] can have the
-    /// same redb file open at the same moment (review finding #3). The lock is
-    /// the ONLY thing serializing this process's two worker threads' opens; see
-    /// `config_db_lock`'s doc.
-    ///
-    /// Returns `None` when the file is *persistently* locked by some OTHER
-    /// handle -- the settings app, in production -- so the caller must KEEP its
-    /// current `self.config` rather than adopt defaults (review finding #2). The
-    /// intra-process `lock` cannot serialize against a different process, so a
-    /// cross-process collision surfaces here as `LoadOutcome::Locked`; we retry
-    /// a few times with a brief backoff (the settings app is documented to hold
-    /// the DB open only momentarily) and only give up -- returning `None` -- if
-    /// it stays locked. A genuinely missing/corrupt file is `Loaded(defaults)`,
-    /// never `Locked`, so this only ever declines to load on a true lock, never
-    /// masking real corruption.
-    fn load_config_locked(lock: &Mutex<()>, path: &std::path::Path) -> Option<Config> {
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        // 4 tries * 25ms = up to ~75ms of backoff before giving up and keeping
-        // the current config. Brief enough not to stall the reload worker
-        // noticeably, long enough to ride out a momentary settings-app write.
-        const ATTEMPTS: u32 = 4;
-        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
-        for attempt in 0..ATTEMPTS {
-            match icedtea_config::try_load(path) {
-                icedtea_config::LoadOutcome::Loaded(cfg) => return Some(cfg),
-                icedtea_config::LoadOutcome::Locked => {
-                    if attempt + 1 < ATTEMPTS {
-                        std::thread::sleep(BACKOFF);
-                    }
-                }
-            }
-        }
-        tracing::warn!(
-            "config db stayed locked across {ATTEMPTS} attempts; keeping current config (no default wipe)"
-        );
-        None
     }
 
     /// Persist `self.config` to the redb file off the render loop, the write
@@ -4224,45 +4181,28 @@ impl State {
     ///
     /// Unlike the reload path this needs no channel back: nothing on the
     /// render loop consumes the result. `config_path` `None` (the default
-    /// boot) resolves to `icedtea_config::default_db_path`, exactly as
+    /// boot) resolves to `icedtea_registry_schema::default_db_path`, exactly as
     /// `spawn_config_reload` does.
     fn spawn_config_save(&self) {
         let config = self.config.clone();
-        let path = self
-            .config_path
-            .clone()
-            .unwrap_or_else(icedtea_config::default_db_path);
-        let lock = Arc::clone(&self.config_db_lock);
-        std::thread::spawn(move || Self::save_config_to(&lock, &config, &path));
+        let Some(registry) = self.registry.clone() else {
+            return;
+        };
+        std::thread::spawn(move || Self::save_config_to(&registry, &config));
     }
 
     /// The synchronous body [`Self::spawn_config_save`] runs on its worker
-    /// thread: open the redb file and write `config`. Failures are logged,
-    /// never propagated -- a persist failure must not take the compositor
-    /// down. Split out so it can be exercised deterministically in a test
-    /// (redb permits only one `Database` handle per file per process, so a
-    /// test that polled the detached thread by re-opening the file would race
-    /// the writer's own open; calling this directly does not).
-    fn save_config_to(lock: &Mutex<()>, config: &Config, path: &std::path::Path) {
-        // Hold the shared open-lock across the whole open + write + drop so a
-        // concurrent `spawn_config_reload` worker cannot have this same redb
-        // file open at the same moment (review finding #3): a second open of a
-        // file redb already has open is `DatabaseAlreadyOpen`, which would turn
-        // one of the two paths into a no-op (a dropped write) or a
-        // default-config wipe (a failed load). See `config_db_lock`'s doc.
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        match icedtea_config::open(path) {
-            Ok(db) => {
-                // Scoped save (review findings #2/#5): the compositor writes ONLY
-                // the displays table, never the appearance/keybindings/workspaces
-                // sections the settings app owns. `Config::save` would rewrite the
-                // whole file and revert a concurrent settings-app edit to those
-                // sections with the compositor's stale in-memory copy.
-                if let Err(err) = config.save_displays(&db) {
-                    tracing::error!(%err, "failed to persist display config");
-                }
-            }
-            Err(err) => tracing::error!(%err, "could not open config db to persist displays"),
+    /// thread: write the displays section through the registry. Failures are
+    /// logged, never propagated -- a persist failure must not take the
+    /// compositor down. Split out so it can be exercised deterministically in a
+    /// test.
+    ///
+    /// Scoped by construction (review findings #2/#5): this writes only the
+    /// displays keys, never the appearance/keybindings/workspaces the settings
+    /// app owns, so a display apply can never revert an unrelated edit.
+    fn save_config_to(registry: &Registry, config: &Config) {
+        if let Err(err) = config.save_displays(registry) {
+            tracing::error!(%err, "failed to persist display config");
         }
     }
 
@@ -4492,7 +4432,7 @@ impl State {
             let Some(name) = head.name.as_deref() else {
                 continue;
             };
-            let entry = icedtea_contract::DisplayConfig {
+            let entry = icedtea_registry_schema::DisplayConfig {
                 name: name.to_string(),
                 enabled: head.enabled,
                 width: head.width,
@@ -5835,7 +5775,7 @@ impl State {
         }
 
         events.push(Event::WorkspaceList(self.window_manager.workspace_info()));
-        events.push(Event::ConfigReloaded(cfg.appearance.clone()));
+        events.push(Event::ConfigReloaded(cfg.appearance.clone().into()));
         self.config = cfg;
         events
     }
@@ -6582,7 +6522,8 @@ impl wlr::OutputHandler for State {
                 // On ANY setter error the output must not be left dark:
                 // fall back to the preferred mode with wlroots' own auto
                 // layout position, exactly the no-config path.
-                if let Err(err) = Self::apply_display_config(&runtime, output, cfg) {
+                let contract_cfg = icedtea_contract::DisplayConfig::from(cfg.clone());
+                if let Err(err) = Self::apply_display_config(&runtime, output, &contract_cfg) {
                     tracing::error!(?err, %name, "persisted display config failed; using preferred mode");
                     if let Err(err) = output.enable_with_preferred_mode() {
                         tracing::error!(?err, "could not enable output");
@@ -9300,8 +9241,8 @@ impl wlr::SeatHandler for State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icedtea_config::default_config;
     use icedtea_contract::Rectangle;
+    use icedtea_registry_schema::default_config;
 
     const DEFAULT_GEO: Rectangle = Rectangle {
         x: 0,
@@ -9855,7 +9796,7 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         // default_config has 4 workspaces; the window stays on workspace 0.
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["A".into(), "B".into()];
         let events = state.apply_config(cfg);
 
@@ -9894,7 +9835,7 @@ mod tests {
         state.window_manager.set_workspace(a, 2).unwrap();
         assert_eq!(state.window_manager.get(a).unwrap().workspace, 2);
 
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
         let events = state.apply_config(cfg);
 
@@ -9928,7 +9869,7 @@ mod tests {
         // Drain setup events so we only observe the reload's.
         state.window_manager.pending_events.clear();
 
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
         let _ = state.apply_config(cfg);
 
@@ -9975,7 +9916,7 @@ mod tests {
         state.window_manager.focus(a).unwrap();
         assert_eq!(state.window_manager.focused_window().map(|w| w.id), Some(a));
 
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["only".into()]; // removes workspaces 1..4
         let _ = state.apply_config(cfg);
 
@@ -10020,7 +9961,7 @@ mod tests {
     #[test]
     fn reload_rethemes_surviving_windows_and_recolors_background() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         // "app" is not GTK-style, so `decoration::has_ssd` gives it a
         // server-side title bar -- `sync_window_to_scene` only rasterizes a
         // title for a decorated, visible window.
@@ -10049,7 +9990,7 @@ mod tests {
             .pixels
             .clone();
 
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.palette.background = "#abcdef".into();
         cfg.appearance.palette.foreground = "#123456".into();
         state.apply_reloaded_config(cfg);
@@ -10072,7 +10013,7 @@ mod tests {
     #[test]
     fn reload_reswaps_wallpaper_only_on_path_change() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state
             .wallpaper
             .set_decoded(Some(image::RgbaImage::from_pixel(
@@ -10080,7 +10021,7 @@ mod tests {
                 1,
                 image::Rgba([0, 0, 0, 255]),
             )));
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.wallpaper = Some("/nonexistent/x.png".into());
         state.apply_reloaded_config(cfg);
         assert!(
@@ -10096,13 +10037,13 @@ mod tests {
     #[test]
     fn reload_leaves_wallpaper_untouched_when_the_path_is_unchanged() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([7, 7, 7, 255]));
         state.wallpaper.set_decoded(Some(img.clone()));
 
         // Same wallpaper path as `default_config()` (`None`), only an
         // unrelated field changes.
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.palette.background = "#abcdef".into();
         assert_eq!(
             cfg.appearance.wallpaper, state.config.appearance.wallpaper,
@@ -10371,7 +10312,7 @@ mod tests {
     #[test]
     fn apply_config_preserves_windows_and_does_not_close_them() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let a = state.window_manager.add_window(
             "a",
             "a",
@@ -10394,7 +10335,7 @@ mod tests {
                 height: 100,
             },
         );
-        let mut cfg = icedtea_config::default_config();
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.appearance.palette.background = "#123456".into();
         let events = state.apply_config(cfg);
         assert!(
@@ -10417,7 +10358,7 @@ mod tests {
         let mut state = State::new(default_config(), tx);
         let a = state.window_manager.add_window("a", "a", 1, DEFAULT_GEO);
         let b = state.window_manager.add_window("b", "b", 2, DEFAULT_GEO);
-        let _ = state.apply_config(icedtea_config::default_config());
+        let _ = state.apply_config(icedtea_registry_schema::default_config());
         let c = state.window_manager.add_window("c", "c", 3, DEFAULT_GEO);
         assert!(c.0 > a.0 && c.0 > b.0, "ids never regress across a reload");
     }
@@ -10542,7 +10483,7 @@ mod tests {
         assert!(state.alt_tab.is_active());
         assert!(state.snap_preview.is_some());
 
-        let _ = state.apply_config(icedtea_config::default_config());
+        let _ = state.apply_config(icedtea_registry_schema::default_config());
 
         assert!(
             state.drag.window_id().is_none(),
@@ -10570,7 +10511,7 @@ mod tests {
         let seq_before = state.window_manager.snapshot().seq;
         assert!(seq_before > 0);
 
-        let _ = state.apply_config(icedtea_config::default_config());
+        let _ = state.apply_config(icedtea_registry_schema::default_config());
 
         assert!(
             state.window_manager.snapshot().seq >= seq_before,
@@ -10609,7 +10550,7 @@ mod tests {
         state.apply_action("cycle:alt_tab").unwrap();
         assert!(state.alt_tab.is_active());
 
-        let events = state.apply_config(icedtea_config::default_config());
+        let events = state.apply_config(icedtea_registry_schema::default_config());
 
         assert!(
             events
@@ -10625,7 +10566,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
         assert!(!state.alt_tab.is_active());
-        let events = state.apply_config(icedtea_config::default_config());
+        let events = state.apply_config(icedtea_registry_schema::default_config());
         assert!(!events.iter().any(|e| matches!(e, Event::AltTabState(_))));
     }
 
@@ -10680,17 +10621,15 @@ mod tests {
     #[test]
     fn reload_config_applies_new_workspaces_and_emits() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
-        // Persist a config with different workspace names, then reload from disk.
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
+        // Persist a config with different workspace names, then reload.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.redb");
-        let db = icedtea_config::open(&path).unwrap();
-        let mut cfg = icedtea_config::default_config();
+        let registry = direct_registry(&dir.path().join("registry.redb"));
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["A".into(), "B".into(), "C".into()];
-        cfg.save(&db).unwrap();
-        drop(db);
+        cfg.save(&registry).unwrap();
 
-        state.config_path = Some(path.clone());
+        state.registry = Some(registry);
         let events = state.reload_config_from_disk();
         assert_eq!(state.window_manager.workspace_info().len(), 3);
         assert!(events.iter().any(|e| matches!(e, Event::ConfigReloaded(_))));
@@ -10724,16 +10663,14 @@ mod tests {
     #[test]
     fn handle_command_reload_spawns_worker_that_delivers_config() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.redb");
-        let db = icedtea_config::open(&path).unwrap();
-        let mut cfg = icedtea_config::default_config();
+        let registry = direct_registry(&dir.path().join("registry.redb"));
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["X".into(), "Y".into()];
-        cfg.save(&db).unwrap();
-        drop(db);
-        state.config_path = Some(path);
+        cfg.save(&registry).unwrap();
+        state.registry = Some(registry);
 
         let (reload_tx, reload_rx) = crossbeam_channel::unbounded::<Config>();
         state.set_config_reload_sender(reload_tx);
@@ -10780,16 +10717,14 @@ mod tests {
     #[test]
     fn apply_action_reload_spawns_worker_that_delivers_config() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cfg.redb");
-        let db = icedtea_config::open(&path).unwrap();
-        let mut cfg = icedtea_config::default_config();
+        let registry = direct_registry(&dir.path().join("registry.redb"));
+        let mut cfg = icedtea_registry_schema::default_config();
         cfg.workspace_names = vec!["P".into(), "Q".into()];
-        cfg.save(&db).unwrap();
-        drop(db);
-        state.config_path = Some(path);
+        cfg.save(&registry).unwrap();
+        state.registry = Some(registry);
 
         let (reload_tx, reload_rx) = crossbeam_channel::unbounded::<Config>();
         state.set_config_reload_sender(reload_tx);
@@ -10946,7 +10881,7 @@ mod tests {
     #[test]
     fn set_maximized_target_resolves_via_the_windows_own_output_not_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.config.appearance.snap_gap = 0;
         state.create_output(
             0,
@@ -10997,7 +10932,7 @@ mod tests {
     #[test]
     fn set_fullscreen_target_resolves_via_the_windows_own_output_not_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -11455,7 +11390,7 @@ mod tests {
         let drained: Vec<SeqEvent> = rx.try_iter().collect();
         assert!(drained.iter().all(|e| e.seq <= before));
 
-        state.apply_reloaded_config(icedtea_config::default_config());
+        state.apply_reloaded_config(icedtea_registry_schema::default_config());
         let events: Vec<SeqEvent> = rx.try_iter().collect();
         assert!(!events.is_empty());
         assert!(
@@ -11821,7 +11756,7 @@ mod tests {
         let mut config = default_config();
         config.keybindings.insert(
             "quit".into(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "KEY_F12".into(),
             },
@@ -12590,7 +12525,7 @@ mod tests {
         let mut cfg = default_config();
         cfg.keybindings.insert(
             "broken".into(),
-            icedtea_config::KeyCombo {
+            icedtea_registry_schema::KeyCombo {
                 modifiers: vec![],
                 key: "NoSuchKeysym".into(),
             },
@@ -12649,7 +12584,7 @@ mod tests {
     #[test]
     fn placement_targets_the_output_under_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12676,7 +12611,7 @@ mod tests {
     #[test]
     fn windows_migrate_off_a_removed_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12726,7 +12661,7 @@ mod tests {
     #[test]
     fn an_oversized_migrated_window_is_centered_not_corner_pinned() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12766,7 +12701,7 @@ mod tests {
     #[test]
     fn migration_with_no_surviving_output_keeps_geometry() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12807,7 +12742,7 @@ mod tests {
         use crate::wayland::ToplevelKey;
 
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12857,7 +12792,7 @@ mod tests {
     #[test]
     fn an_exclusive_top_panel_shrinks_the_usable_area() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -12907,7 +12842,7 @@ mod tests {
     #[test]
     fn maximize_respects_the_usable_area_but_fullscreen_ignores_it() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         // Snapping/maximize geometry math (`layout::maximized_geometry`)
         // also insets by `appearance.snap_gap`; zero it here so the
         // expected numbers below are the panel's carve alone, not a mix of
@@ -13021,7 +12956,7 @@ mod tests {
     #[test]
     fn an_unmapped_layer_entry_does_not_reserve_until_mapped() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13082,7 +13017,7 @@ mod tests {
     #[test]
     fn arrange_layers_does_not_resync_a_maximized_window_when_the_target_is_unchanged() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.config.appearance.snap_gap = 0;
         state.create_output(
             0,
@@ -13138,7 +13073,7 @@ mod tests {
     #[test]
     fn arrange_layers_resyncs_a_maximized_window_against_its_own_output_not_the_pointers() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.config.appearance.snap_gap = 0;
         state.create_output(
             0,
@@ -13228,7 +13163,7 @@ mod tests {
     #[test]
     fn resolve_orphaned_layers_configures_a_layer_surface_parked_with_no_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let id = wlr::LayerSurfaceId::dangling_for_test();
         state.layers.insert(
             id,
@@ -13265,7 +13200,7 @@ mod tests {
     #[test]
     fn resolve_orphaned_layers_rehomes_onto_a_surviving_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13313,7 +13248,7 @@ mod tests {
     #[test]
     fn resolve_orphaned_layers_rehomes_each_entry_by_its_own_frame_center() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13360,7 +13295,7 @@ mod tests {
     #[test]
     fn resolve_orphaned_layers_is_a_no_op_with_no_surviving_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13557,7 +13492,7 @@ mod tests {
     #[test]
     fn arrange_layers_leaves_layer_focus_alone_and_unmap_clears_it() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13623,7 +13558,7 @@ mod tests {
     #[test]
     fn a_layer_surface_that_becomes_interactive_after_map_takes_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13660,7 +13595,7 @@ mod tests {
     #[test]
     fn a_layer_surface_that_stops_being_interactive_releases_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13696,7 +13631,7 @@ mod tests {
     #[test]
     fn an_unmapped_surface_does_not_take_focus_on_becoming_interactive() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13724,7 +13659,7 @@ mod tests {
     #[test]
     fn an_already_focused_layer_is_not_stolen_from_by_another_turning_interactive() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13764,7 +13699,7 @@ mod tests {
     #[test]
     fn usable_before_stacks_two_same_edge_panels_instead_of_overlapping() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13836,7 +13771,7 @@ mod tests {
     #[test]
     fn two_large_exclusive_top_panels_do_not_overflow_or_panic() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13929,7 +13864,7 @@ mod tests {
     #[test]
     fn clicking_a_window_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -13980,7 +13915,7 @@ mod tests {
     #[test]
     fn db_command_focus_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14045,7 +13980,7 @@ mod tests {
     #[test]
     fn a_failing_db_command_focus_does_not_release_layer_focus() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14095,7 +14030,7 @@ mod tests {
     #[test]
     fn alt_tab_cycling_releases_layer_focus_for_an_interactive_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14162,7 +14097,7 @@ mod tests {
     fn xwayland_activate_flags_attention_and_never_steals_the_keyboard() {
         use wlr::ToplevelHandler as _;
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14271,7 +14206,7 @@ mod tests {
     fn activation_requests_are_ignored_while_the_session_is_locked() {
         use wlr::SeatHandler as _;
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14360,7 +14295,7 @@ mod tests {
     fn xwayland_activate_requests_are_ignored_while_the_session_is_locked() {
         use wlr::{SeatHandler as _, ToplevelHandler as _};
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14414,7 +14349,7 @@ mod tests {
     fn a_pointer_press_does_not_move_focus_while_the_session_is_locked() {
         use wlr::SeatHandler as _;
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14477,7 +14412,7 @@ mod tests {
     #[test]
     fn attention_is_not_raised_on_an_unmapped_target() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let id = state.window_manager.add_window("app", "t", 1, DEFAULT_GEO);
         state.window_manager.set_mapped(id, false);
 
@@ -14511,7 +14446,7 @@ mod tests {
     #[test]
     fn restoring_a_minimized_window_clears_its_attention_hint() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14570,7 +14505,7 @@ mod tests {
     #[test]
     fn switching_to_a_workspace_clears_its_focused_window_s_attention() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14640,7 +14575,7 @@ mod tests {
     #[test]
     fn arrange_layers_reconfigures_every_mapped_panel_even_without_its_own_commit() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14693,7 +14628,7 @@ mod tests {
     #[test]
     fn arrange_layers_does_not_reconfigure_an_unchanged_panel() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14776,7 +14711,7 @@ mod tests {
     #[test]
     fn a_top_anchored_panel_still_spans_the_box_at_its_desired_thickness() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14800,7 +14735,7 @@ mod tests {
     #[test]
     fn a_corner_anchored_layer_surface_keeps_its_desired_size() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14851,7 +14786,7 @@ mod tests {
     #[test]
     fn a_corner_anchored_panel_keeps_its_desired_width() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14897,7 +14832,7 @@ mod tests {
     #[test]
     fn a_corner_anchored_exclusive_zone_reserves_nothing() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -14960,7 +14895,7 @@ mod tests {
     fn a_single_edge_only_anchor_still_reserves_its_exclusive_zone() {
         let (tx, _rx) = crossbeam_channel::unbounded();
 
-        let mut top = State::new(icedtea_config::default_config(), tx.clone());
+        let mut top = State::new(icedtea_registry_schema::default_config(), tx.clone());
         top.create_output(
             0,
             Rectangle {
@@ -15002,7 +14937,7 @@ mod tests {
             "ANCHOR_TOP alone with a positive exclusive_zone must reserve at the top (WLCS conformance shape)"
         );
 
-        let mut bottom = State::new(icedtea_config::default_config(), tx.clone());
+        let mut bottom = State::new(icedtea_registry_schema::default_config(), tx.clone());
         bottom.create_output(
             0,
             Rectangle {
@@ -15044,7 +14979,7 @@ mod tests {
             "ANCHOR_BOTTOM alone with a positive exclusive_zone must reserve at the bottom"
         );
 
-        let mut left = State::new(icedtea_config::default_config(), tx.clone());
+        let mut left = State::new(icedtea_registry_schema::default_config(), tx.clone());
         left.create_output(
             0,
             Rectangle {
@@ -15086,7 +15021,7 @@ mod tests {
             "ANCHOR_LEFT alone with a positive exclusive_zone must reserve at the left"
         );
 
-        let mut right = State::new(icedtea_config::default_config(), tx);
+        let mut right = State::new(icedtea_registry_schema::default_config(), tx);
         right.create_output(
             0,
             Rectangle {
@@ -15139,7 +15074,7 @@ mod tests {
     #[test]
     fn arrange_layers_skips_hidden_maximized_windows_in_the_resync() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.config.appearance.snap_gap = 0;
         state.create_output(
             0,
@@ -15219,7 +15154,7 @@ mod tests {
     #[test]
     fn a_four_edge_anchored_layer_surface_fills_the_usable_box() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15264,7 +15199,7 @@ mod tests {
     #[test]
     fn an_unanchored_zero_sized_layer_surface_also_fills_the_usable_box() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15305,7 +15240,7 @@ mod tests {
     #[test]
     fn an_unanchored_sized_layer_surface_is_centered() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15350,7 +15285,7 @@ mod tests {
     #[test]
     fn a_pathologically_large_desired_size_is_clamped_to_the_output() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15428,7 +15363,7 @@ mod tests {
         use wlr::ToplevelHandler;
 
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15478,7 +15413,7 @@ mod tests {
         use wlr::ToplevelHandler;
 
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15536,7 +15471,7 @@ mod tests {
     #[test]
     fn switching_to_a_workspace_whose_focus_is_minimized_repicks() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -15669,23 +15604,29 @@ mod tests {
         );
     }
 
+    /// A direct (no-bus) registry over a temp store, for the config I/O tests.
+    fn direct_registry(path: &std::path::Path) -> Registry {
+        let store = icedtea_registry::Store::open(path, icedtea_registry_schema::schema())
+            .expect("open the test registry");
+        Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
+    }
+
     #[test]
     fn save_config_to_persists_displays_to_redb() {
-        // Exercises the exact synchronous body `spawn_config_save` runs on
-        // its worker thread (see `save_config_to`'s doc for why the detached
-        // thread itself is not what the test drives). The upserted displays
-        // must survive a real `load_or_default` round-trip.
+        // Exercises the exact synchronous body `spawn_config_save` runs on its
+        // worker thread. The upserted displays must survive a real
+        // `Config::load` round-trip.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.redb");
+        let registry = direct_registry(&dir.path().join("registry.redb"));
 
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut state = State::new(default_config(), tx);
-        state.config_path = Some(path.clone());
+        state.registry = Some(registry.clone());
         state.upsert_displays_from_heads(&[head("DP-1", true)]);
 
-        State::save_config_to(&state.config_db_lock, &state.config, &path);
+        State::save_config_to(&registry, &state.config);
 
-        let loaded = icedtea_config::load_or_default(&path);
+        let loaded = icedtea_registry_schema::Config::load(&registry).unwrap();
         assert_eq!(
             loaded.displays.len(),
             1,
@@ -15694,112 +15635,6 @@ mod tests {
         assert_eq!(loaded.displays[0].name, "DP-1");
         assert_eq!(loaded.displays[0].width, 1920);
         assert_eq!(loaded.displays[0].refresh_mhz, 60_000);
-    }
-
-    #[test]
-    fn racing_save_and_reload_never_wipes_live_config() {
-        // Review finding #3: `spawn_config_save` and `spawn_config_reload`
-        // each open a fresh redb `Database` on a detached worker thread, but
-        // redb permits only ONE handle per file per process. Without the
-        // shared open-lock a save racing a reload hits `DatabaseAlreadyOpen`;
-        // `load_or_default` then silently returns `default_config()`, WIPING
-        // the live appearance/keybindings/workspaces on disk. The lock (held
-        // by each worker across its whole open+use+drop) serializes the two
-        // opens so neither ever observes a file the other still has open. This
-        // hammers both real code paths (`save_config_to` /
-        // `load_config_locked`) through one shared lock and asserts no reload
-        // ever surfaced a wipe. Remove the lock and DatabaseAlreadyOpen makes
-        // this fail.
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.redb");
-
-        // Seed a NON-default config so a wipe is observable: a load that comes
-        // back with the default workspace names is a wipe; one that sees these
-        // custom names is a real read.
-        let mut seeded = default_config();
-        seeded.workspace_names = vec!["alpha".into(), "beta".into(), "gamma".into()];
-        assert_ne!(seeded.workspace_names, default_config().workspace_names);
-        {
-            let db = icedtea_config::open(&path).expect("seed open");
-            seeded.save(&db).expect("seed save");
-        }
-
-        let lock = Arc::new(Mutex::new(()));
-        let wiped = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
-
-        // Writers: persist the seeded (non-default) config repeatedly.
-        for _ in 0..8 {
-            let lock = Arc::clone(&lock);
-            let cfg = seeded.clone();
-            let path = path.clone();
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..12 {
-                    State::save_config_to(&lock, &cfg, &path);
-                }
-            }));
-        }
-        // Readers: load through the same lock and flag any default wipe.
-        for _ in 0..8 {
-            let lock = Arc::clone(&lock);
-            let path = path.clone();
-            let wiped = Arc::clone(&wiped);
-            let default_names = default_config().workspace_names;
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..12 {
-                    // `None` == kept current (a persistent lock), never a wipe.
-                    // A `Some` whose workspaces went default IS the wipe we guard
-                    // against.
-                    if let Some(cfg) = State::load_config_locked(&lock, &path)
-                        && cfg.workspace_names == default_names
-                    {
-                        wiped.store(true, Ordering::SeqCst);
-                    }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("worker thread panicked");
-        }
-
-        assert!(
-            !wiped.load(Ordering::SeqCst),
-            "a save/reload race surfaced default_config() -- the live config was wiped"
-        );
-        // The file still holds the seeded config after all the racing opens.
-        let final_cfg = icedtea_config::load_or_default(&path);
-        assert_eq!(final_cfg.workspace_names, seeded.workspace_names);
-    }
-
-    #[test]
-    fn load_config_locked_keeps_current_on_persistent_lock() {
-        // Review finding #2: a cross-process open collision (the settings app
-        // holding the DB) must NEVER downgrade the live config to defaults.
-        // `load_config_locked` returns `None` (== keep `self.config`) when the
-        // file stays locked, rather than `Some(default_config())`. Simulate the
-        // collision by holding a live redb handle across the call: redb's
-        // whole-file lock rejects the second opener within this process too, so
-        // every retry sees `LoadOutcome::Locked` and the method gives up with
-        // `None`.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.redb");
-
-        let mut seeded = default_config();
-        seeded.workspace_names = vec!["keepme".into()];
-        {
-            let db = icedtea_config::open(&path).expect("seed open");
-            seeded.save(&db).expect("seed save");
-        }
-
-        let lock = Arc::new(Mutex::new(()));
-        // Hold the DB open for the whole load attempt so it stays locked.
-        let _held = icedtea_config::open(&path).expect("hold open");
-        assert!(
-            State::load_config_locked(&lock, &path).is_none(),
-            "a persistently locked db must return None (keep current), never a default wipe"
-        );
     }
 
     #[test]
@@ -15878,7 +15713,7 @@ mod tests {
         // persisted-bool guard (`any_display_enabled`) returned "safe to
         // disable" here BECAUSE DP-1 is persisted enabled -- exactly the bug.
         state.config.displays = vec![
-            icedtea_contract::DisplayConfig {
+            icedtea_registry_schema::DisplayConfig {
                 name: "eDP-1".into(),
                 enabled: false,
                 width: 1920,
@@ -15889,7 +15724,7 @@ mod tests {
                 scale: 1.0,
                 transform: 0,
             },
-            icedtea_contract::DisplayConfig {
+            icedtea_registry_schema::DisplayConfig {
                 name: "DP-1".into(),
                 enabled: true,
                 width: 2560,
@@ -16117,7 +15952,7 @@ mod tests {
     #[test]
     fn a_recorded_popup_chain_reports_its_root_and_orders_itself_deepest_last() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let window = state.window_manager.add_window(
             "app",
             "t",
@@ -16171,7 +16006,7 @@ mod tests {
     #[test]
     fn forgetting_a_popup_clears_both_the_map_and_the_stack() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let window = state.window_manager.add_window(
             "app",
             "t",
@@ -16210,7 +16045,7 @@ mod tests {
     #[test]
     fn a_popup_on_an_unmodelled_host_is_not_recorded() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         // A parent popup that was never recorded: the client raced its own
         // destroy against the child's creation.
         state.record_popup(
@@ -16240,7 +16075,7 @@ mod tests {
     #[test]
     fn a_popups_constraint_box_is_the_usable_area_in_root_surface_coordinates() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -16323,7 +16158,7 @@ mod tests {
     #[test]
     fn popup_at_point_finds_the_topmost_mapped_popup_and_nothing_while_locked() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -16422,7 +16257,7 @@ mod tests {
     #[test]
     fn hostile_popup_geometry_never_panics() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         state.create_output(
             0,
             Rectangle {
@@ -16476,7 +16311,7 @@ mod tests {
     #[test]
     fn a_grabbing_chains_end_returns_focus_to_its_root_not_to_the_pointer() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let a = state.window_manager.add_window(
             "a.app",
             "a",
@@ -16540,7 +16375,7 @@ mod tests {
     #[test]
     fn a_non_grabbing_chain_never_moves_focus_at_either_end() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let a = state.window_manager.add_window(
             "a.app",
             "a",
@@ -16582,7 +16417,7 @@ mod tests {
     #[test]
     fn a_dying_root_prunes_every_popup_under_it() {
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let mut state = State::new(icedtea_config::default_config(), tx);
+        let mut state = State::new(icedtea_registry_schema::default_config(), tx);
         let window = state.window_manager.add_window(
             "app",
             "t",

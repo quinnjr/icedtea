@@ -35,6 +35,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use icedtea_contract::{Appearance, COMPOSITOR_BUS_NAME, COMPOSITOR_IFACE, COMPOSITOR_PATH};
+use icedtea_registry::REGISTRY_BUS_NAME;
 use icedtea_settings::compositor_reload::{ReloadClient, ReloadOutcome};
 use icedtea_settings::model;
 
@@ -86,6 +87,21 @@ fn compositor_binary() -> PathBuf {
     bin
 }
 
+/// Path to the `icedtea-registryd` binary, building it first if this profile
+/// directory doesn't have one yet.
+fn registryd_binary() -> PathBuf {
+    let bin = target_profile_dir().join("icedtea-registryd");
+    if !bin.exists() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "icedtea-registryd"])
+            .status()
+            .expect("failed to invoke cargo to build icedtea-registryd");
+        assert!(status.success(), "cargo build -p icedtea-registryd failed");
+    }
+    bin
+}
+
 /// Poll `org.freedesktop.DBus`'s `NameHasOwner` until `name` is owned or
 /// `timeout` elapses.
 fn wait_for_name_owner(conn: &zbus::blocking::Connection, name: &str, timeout: Duration) -> bool {
@@ -129,14 +145,34 @@ fn apply_reloads_the_running_compositor() {
         eprintln!("SKIP: {COMPOSITOR_BUS_NAME} is already owned -- a real compositor is running");
         return;
     }
+    if wait_for_name_owner(&probe, REGISTRY_BUS_NAME, Duration::from_millis(1)) {
+        eprintln!(
+            "SKIP: {REGISTRY_BUS_NAME} is already owned -- a real registry daemon is running"
+        );
+        return;
+    }
 
-    // temp XDG_CONFIG_HOME so default_db_path() -> temp/icedtea/config.redb
+    // A temp XDG_CONFIG_HOME, and a real registry daemon owning the store so
+    // both the compositor child and this test process reach it over the bus.
+    // (Opening the file directly from both sides would collide on redb's
+    // exclusive lock -- which is exactly the bug the daemon exists to prevent.)
     let xdg_config_home = tempfile::tempdir().expect("tempdir");
-    let db_path = xdg_config_home.path().join("icedtea").join("config.redb");
+    std::fs::create_dir_all(xdg_config_home.path().join("icedtea")).expect("create the config dir");
 
-    // spawn (the real) compositor pointed at that path (reads it at boot,
-    // via icedtea_compositor::run()'s own `default_db_path()` call, which
-    // resolves under the child's own XDG_CONFIG_HOME).
+    let registryd = Command::new(registryd_binary())
+        .env("XDG_CONFIG_HOME", xdg_config_home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn icedtea-registryd");
+    let _registryd_guard = ChildGuard(registryd);
+    assert!(
+        wait_for_name_owner(&probe, REGISTRY_BUS_NAME, BOOT_TIMEOUT),
+        "icedtea-registryd never registered {REGISTRY_BUS_NAME} within {BOOT_TIMEOUT:?}"
+    );
+
+    // spawn (the real) compositor; it finds the registry daemon on the bus.
     let child = Command::new(compositor_binary())
         .env("XDG_CONFIG_HOME", xdg_config_home.path())
         .env("WLR_BACKENDS", "headless")
@@ -175,14 +211,15 @@ fn apply_reloads_the_running_compositor() {
         }
     });
 
-    // load_or_default -> set accent -> apply -> ReloadConfig
-    let mut cfg = icedtea_config::load_or_default(&db_path);
+    // load -> set accent -> apply -> ReloadConfig, all through the daemon.
+    let registry = icedtea_registry_schema::connect().expect("connect to the registry daemon");
+    let mut cfg = icedtea_registry_schema::Config::load_or_default(&registry);
     assert_ne!(
         cfg.appearance.palette.accent, NEW_ACCENT,
         "test is only non-vacuous if the accent actually changes from the default"
     );
     cfg.appearance.palette.accent = NEW_ACCENT.to_string();
-    model::apply(&cfg, &db_path).expect("save the edited config to the temp db");
+    model::apply(&cfg, &registry).expect("save the edited config to the temp registry");
 
     let client = ReloadClient::new();
     assert_eq!(

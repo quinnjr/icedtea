@@ -11,7 +11,7 @@
 //! and the launcher-side index resolves the same entry (`DesktopIndex`).
 
 use icedtea_compositor::state::{self, State};
-use icedtea_config::default_config;
+use icedtea_registry_schema::default_config;
 
 mod support;
 

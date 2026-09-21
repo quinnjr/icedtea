@@ -1,0 +1,19 @@
+[package]
+name = "icedtea-registryd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "icedtea-registryd"
+path = "src/main.rs"
+
+[dependencies]
+icedtea-registry = { path = "../registry" }
+icedtea-registry-schema = { path = "../registry-schema" }
+crossbeam-channel.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

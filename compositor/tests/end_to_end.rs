@@ -5,8 +5,8 @@
 
 use icedtea_compositor::dbus::DbCommand;
 use icedtea_compositor::state::{OutputSurface, State};
-use icedtea_config::default_config;
 use icedtea_contract::{Event, Rectangle};
+use icedtea_registry_schema::default_config;
 
 #[test]
 fn window_lifecycle_and_dbus_commands() {

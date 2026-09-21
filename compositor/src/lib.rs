@@ -85,8 +85,13 @@ pub fn run() {
     let choice = backend::BackendChoice::from_args(std::env::args());
     backend::apply_backend_choice(choice);
 
-    let db_path = icedtea_config::default_db_path();
-    let config = icedtea_config::load_or_default(&db_path);
+    // The registry when reachable, a direct store otherwise; an unreachable
+    // registry degrades to schema defaults so the compositor always boots.
+    let registry = icedtea_registry_schema::connect().ok();
+    let config = registry
+        .as_ref()
+        .map(icedtea_registry_schema::Config::load_or_default)
+        .unwrap_or_default();
 
     let display = wlr::Display::new().expect("failed to create the wayland display");
     let runtime = wlr::Runtime::new().expect("failed to create the scene graph");
@@ -217,13 +222,14 @@ pub fn run() {
 
     let (dbus_tx, dbus_events_rx) = crossbeam_channel::unbounded::<SeqEvent>();
     let mut state = State::new(config, dbus_tx);
+    state.registry = registry;
     state.wayland.attach(runtime.clone());
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<dbus::DbCommand>();
     state.set_command_receiver(cmd_rx);
 
     let (config_reload_tx, config_reload_rx) =
-        crossbeam_channel::unbounded::<icedtea_config::Config>();
+        crossbeam_channel::unbounded::<icedtea_registry_schema::Config>();
     state.set_config_reload_sender(config_reload_tx);
     state.set_config_reload_receiver(config_reload_rx);
 

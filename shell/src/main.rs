@@ -102,9 +102,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `load_or_default` never fails (missing/corrupt/locked DB -> defaults),
     // so the bar always opens; a store the settings app currently holds
     // locked reads back as defaults until the next restart.
-    let bar_position = icedtea_config::load_or_default(&icedtea_config::default_db_path())
-        .appearance
-        .bar_position;
+    let bar_position = match icedtea_registry_schema::connect() {
+        Ok(registry) => {
+            icedtea_registry_schema::Config::load_or_default(&registry)
+                .appearance
+                .bar_position
+        }
+        Err(err) => {
+            tracing::warn!(%err, "registry unavailable; using the default bar position");
+            icedtea_registry_schema::default_config()
+                .appearance
+                .bar_position
+        }
+    };
     // Parse once at the config boundary: warn here on unrecognized values
     // (panel::spec would warn again on its own &str path, which is why the
     // binary calls spec_for with the already-parsed position instead).

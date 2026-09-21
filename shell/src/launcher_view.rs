@@ -17,7 +17,6 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use icedtea_ui::view::builders::{SearchEntryExt, box_, button, label, search_entry};
@@ -192,68 +191,22 @@ pub struct LauncherModel {
     /// power action, Escape); `run_surface` points it at the config DB,
     /// so a reopened menu still shows the pins and recency. `None` (unit
     /// tests) means no write-back.
-    pub on_persist: Option<Rc<dyn Fn(icedtea_config::LauncherConfig)>>,
+    pub on_persist: Option<Rc<dyn Fn(icedtea_registry_schema::LauncherConfig)>>,
 }
 
-/// Consecutive launcher write-back failures, sticky across closes: the
-/// final fallback only warns and drops, so the streak rides along in the
-/// message instead of vanishing with the dismissed menu.
-static WRITE_BACK_FAILURES: AtomicU32 = AtomicU32::new(0);
-
-/// True when a write-back failure message looks like lock/busy contention
-/// (another writer holds the config DB) rather than corruption or I/O:
-/// only contention is worth a retry with backoff.
-fn is_lock_busy(message: &str) -> bool {
-    message.contains("Cannot acquire lock") || message.contains("still in progress")
-}
-
-/// Persist one launcher snapshot through the scoped
-/// [`icedtea_config::Config::save_launcher`] (launcher table only — never
-/// a full [`icedtea_config::Config::save`], which would clobber a
-/// concurrent settings-app edit with this process's stale in-memory
-/// copy). Reads the current file first so the other sections survive;
-/// every failure comes back as `Err`, never a panic.
+/// Persist one launcher snapshot through the registry's scoped launcher save.
 ///
-/// A lock/busy failure (the settings app or compositor holds the DB)
-/// retries with a short backoff before giving up; the streak of
-/// consecutive failures rides in the returned message, and the caller
-/// keeps warn-and-drop as the final fallback.
+/// The old lock/busy retry is gone by construction: the daemon is the sole
+/// writer, so a second writer cannot hold the file. The only failure left is
+/// the registry being unreachable, which the caller warn-and-drops.
 pub fn persist_launcher_config(
-    db_path: &std::path::Path,
-    launcher: &icedtea_config::LauncherConfig,
+    registry: &icedtea_registry::Registry,
+    launcher: &icedtea_registry_schema::LauncherConfig,
 ) -> Result<(), String> {
-    const ATTEMPTS: u32 = 3;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match persist_launcher_config_once(db_path, launcher) {
-            Ok(()) => {
-                WRITE_BACK_FAILURES.store(0, Ordering::Relaxed);
-                return Ok(());
-            }
-            Err(err) if attempt < ATTEMPTS && is_lock_busy(&err) => {
-                std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(attempt)));
-            }
-            Err(err) => {
-                let streak = WRITE_BACK_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                return Err(format!("{err} (write-back failure #{streak})"));
-            }
-        }
-    }
-}
-
-/// One write-back attempt: what [`persist_launcher_config`] retries.
-fn persist_launcher_config_once(
-    db_path: &std::path::Path,
-    launcher: &icedtea_config::LauncherConfig,
-) -> Result<(), String> {
-    let mut full = icedtea_config::load_or_default(db_path);
-    full.launcher = launcher.clone();
-    let db = icedtea_config::open(db_path)
-        .map_err(|err| format!("launcher write-back: cannot open config db: {err}"))?;
-    full.save_launcher(&db)
-        .map_err(|err| format!("launcher write-back: cannot save: {err}"))?;
-    Ok(())
+    launcher
+        .save(registry)
+        .map(|_| ())
+        .map_err(|err| format!("launcher write-back: {err}"))
 }
 
 /// The one real power invocation: `program` + `args` is exactly
@@ -414,7 +367,7 @@ impl LauncherModel {
     /// Seed the pin/tile/recency stores from the persisted config (read
     /// path; the write-back is [`LauncherModel::close`] → `on_persist` →
     /// [`persist_launcher_config`], wired in `run_surface`).
-    pub fn seed(&mut self, config: &icedtea_config::LauncherConfig) {
+    pub fn seed(&mut self, config: &icedtea_registry_schema::LauncherConfig) {
         for id in &config.pinned {
             self.pins.pin(id);
         }
@@ -608,14 +561,14 @@ impl LauncherModel {
     /// The pin/tile/recency stores as one persistable config section: what
     /// [`LauncherModel::close`] hands to `on_persist`, and what
     /// [`LauncherModel::seed`] reads back on the next open.
-    pub fn snapshot(&self) -> icedtea_config::LauncherConfig {
-        icedtea_config::LauncherConfig {
+    pub fn snapshot(&self) -> icedtea_registry_schema::LauncherConfig {
+        icedtea_registry_schema::LauncherConfig {
             pinned: self.pins.pinned().to_vec(),
             tile_groups: self
                 .tiles
                 .groups()
                 .iter()
-                .map(|group| icedtea_config::TileGroup {
+                .map(|group| icedtea_registry_schema::TileGroup {
                     name: group.name.clone(),
                     ids: group.ids.clone(),
                     size: group.size,
@@ -959,7 +912,7 @@ fn left_rail(m: &LauncherModel, results: &[SearchResult], top: Option<&str>) -> 
 
 /// The tiles pane: one group container per tile group, holding the member
 /// rows that match the filter. Each tile's width follows its group's
-/// [`TileGroup`](icedtea_config::TileGroup) `size` in [`TILE_PX`] units.
+/// [`TileGroup`](icedtea_registry_schema::TileGroup) `size` in [`TILE_PX`] units.
 /// Tiles are drag sources and drop targets, so a drop reorders them.
 fn tiles_pane(
     m: &LauncherModel,
@@ -1419,21 +1372,32 @@ fn run_surface(
         }
     };
     let mut model = LauncherModel::new(wm);
-    let db_path = icedtea_config::default_db_path();
-    model.seed(&icedtea_config::load_or_default(&db_path).launcher);
+    // The launcher's pins/tiles/recency live in the registry; an unreachable
+    // daemon degrades to the defaults and no write-back, never a panic.
+    let registry = icedtea_registry_schema::connect().ok();
+    let launcher_config = registry
+        .as_ref()
+        .map(|reg| icedtea_registry_schema::Config::load_or_default(reg).launcher)
+        .unwrap_or_default();
+    model.seed(&launcher_config);
     // The files provider is a runtime-only, bounded, read-only index of the
     // XDG user dirs + recent list. Unit tests leave `files` at `None`.
     model.files = Some(FilesProvider::from_env());
     model.on_close = Some(notify.clone());
-    // Write-back for the next open: pin/unpin + recency mutations reach
-    // the launcher table on every close. Failures warn and drop — a dead
-    // or locked DB must degrade to "the menu never persists", never a
-    // panic on this foreign thread, and never the panel.
-    model.on_persist = Some(Rc::new(move |launcher| {
-        if let Err(err) = persist_launcher_config(&db_path, &launcher) {
-            tracing::warn!(%err, "launcher write-back failed; reopen may show stale pins/recency");
-        }
-    }));
+    // Write-back for the next open: pin/unpin + recency mutations reach the
+    // launcher keys on every close. Failures warn and drop — an unreachable
+    // registry must degrade to "the menu never persists", never a panic on
+    // this foreign thread, and never the panel.
+    model.on_persist = registry.map(|registry| {
+        Rc::new(move |launcher| {
+            if let Err(err) = persist_launcher_config(&registry, &launcher) {
+                tracing::warn!(
+                    %err,
+                    "launcher write-back failed; reopen may show stale pins/recency"
+                );
+            }
+        }) as Rc<dyn Fn(icedtea_registry_schema::LauncherConfig)>
+    });
     model.open();
     let window = match icedtea_ui::window::Window::open(
         spec(bar_position),
@@ -2090,7 +2054,7 @@ mod tests {
     #[test]
     fn close_persists_pins_tiles_and_recency_for_reopen() {
         let (mut m, _) = seeded();
-        let saved: Rc<RefCell<Vec<icedtea_config::LauncherConfig>>> =
+        let saved: Rc<RefCell<Vec<icedtea_registry_schema::LauncherConfig>>> =
             Rc::new(RefCell::new(Vec::new()));
         let probe = saved.clone();
         m.on_persist = Some(Rc::new(move |cfg| probe.borrow_mut().push(cfg)));
@@ -2179,9 +2143,9 @@ mod tests {
         let mut m = LauncherModel::new(wm);
         let mut recency = HashMap::new();
         recency.insert("music".to_string(), (3u64, 7u64));
-        m.seed(&icedtea_config::LauncherConfig {
+        m.seed(&icedtea_registry_schema::LauncherConfig {
             pinned: vec!["music".to_string()],
-            tile_groups: vec![icedtea_config::TileGroup {
+            tile_groups: vec![icedtea_registry_schema::TileGroup {
                 name: "Media".to_string(),
                 ids: vec!["music".to_string()],
                 size: 2,
@@ -2220,9 +2184,9 @@ mod tests {
         m.index = DesktopIndex::from_entries(vec![entry("music", "Music")]);
         // A 0 span in hand-editable redb: the seed clamps it to one unit,
         // so the tile still paints instead of collapsing to zero width.
-        m.seed(&icedtea_config::LauncherConfig {
+        m.seed(&icedtea_registry_schema::LauncherConfig {
             pinned: Vec::new(),
-            tile_groups: vec![icedtea_config::TileGroup {
+            tile_groups: vec![icedtea_registry_schema::TileGroup {
                 name: "Media".to_string(),
                 ids: vec!["music".to_string()],
                 size: 0,

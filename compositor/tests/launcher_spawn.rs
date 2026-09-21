@@ -22,7 +22,7 @@
 mod support;
 
 use icedtea_compositor::state::State;
-use icedtea_config::default_config;
+use icedtea_registry_schema::default_config;
 use support::{assert_quiescent, seed_touch_entry, spawn_app, tmpdir, wait_for};
 
 fn state_with_app_dir(dir: &std::path::Path) -> State {

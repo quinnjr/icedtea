@@ -316,7 +316,7 @@ impl Keymap {
     /// a panic.
     ///
     /// This is the equivalent of GDK's `translate_key(keycode, 0, 0)`, and the
-    /// only thing an accelerator capture may store: `icedtea_config`'s
+    /// only thing an accelerator capture may store: `icedtea_registry_schema`'s
     /// `key_name_to_keysym` always encodes the unshifted keysym, so a capture
     /// that stored `XK_Q` from `SUPER+SHIFT+q` would produce a binding the
     /// compositor's `match_action` can never fire.

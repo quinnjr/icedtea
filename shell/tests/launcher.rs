@@ -77,9 +77,9 @@ fn seeded_model(dir: &TempDir) -> (LauncherModel, Rc<MockWm>) {
     let mut model = LauncherModel::new(wm.clone());
     model.dirs = vec![dir.path().to_path_buf()];
     // Seed through the real config path: one pin, one size-2 tile group.
-    model.seed(&icedtea_config::LauncherConfig {
+    model.seed(&icedtea_registry_schema::LauncherConfig {
         pinned: vec!["firefox".to_string()],
-        tile_groups: vec![icedtea_config::TileGroup {
+        tile_groups: vec![icedtea_registry_schema::TileGroup {
             name: "Web".to_string(),
             ids: vec!["firefox".to_string()],
             size: 2,
@@ -88,6 +88,17 @@ fn seeded_model(dir: &TempDir) -> (LauncherModel, Rc<MockWm>) {
     });
     model.open();
     (model, wm)
+}
+
+/// A direct (no-bus) registry over a temp store — what keeps these tests
+/// hermetic now that the launcher persists through `org.icedtea.Registry`.
+fn direct_registry(dir: &TempDir) -> icedtea_registry::Registry {
+    let store = icedtea_registry::Store::open(
+        &dir.path().join("registry.redb"),
+        icedtea_registry_schema::schema(),
+    )
+    .expect("open the test store");
+    icedtea_registry::Registry::direct(std::sync::Arc::new(std::sync::Mutex::new(store)))
 }
 
 /// Lay the launcher out offscreen under `theme`, exactly as the running
@@ -225,7 +236,7 @@ fn pin_and_recency_survive_close_and_reopen() {
 
     let dir = app_dir();
     let db_dir = TempDir::new("launcher-persist");
-    let db_path = db_dir.path().join("cfg.redb");
+    let registry = direct_registry(&db_dir);
 
     // Session 1: pin first (no close yet), then launch — the successful
     // launch closes the menu, and the close writes pins + recency back.
@@ -237,9 +248,9 @@ fn pin_and_recency_survive_close_and_reopen() {
         let mut model = LauncherModel::new(wm);
         model.dirs = vec![dir.path().to_path_buf()];
         model.open();
-        let path = db_path.clone();
+        let reg = registry.clone();
         model.on_persist = Some(Rc::new(move |cfg| {
-            persist_launcher_config(&path, &cfg).expect("test write-back")
+            persist_launcher_config(&reg, &cfg).expect("test write-back")
         }));
         let _ = launcher_view::update(&mut model, LauncherMsg::TogglePin("music".into()));
         let _ = launcher_view::update(
@@ -251,7 +262,7 @@ fn pin_and_recency_survive_close_and_reopen() {
         );
     }
 
-    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    let stored = icedtea_registry_schema::Config::load_or_default(&registry).launcher;
     assert!(
         stored.pinned.contains(&"music".to_string()),
         "the pin survived the close: {:?}",
@@ -286,7 +297,7 @@ fn tile_reorder_round_trips_through_save_and_reopen() {
 
     let dir = app_dir();
     let db_dir = TempDir::new("launcher-reorder");
-    let db_path = db_dir.path().join("cfg.redb");
+    let registry = direct_registry(&db_dir);
 
     // Session 1: reorder, then close to write the stores back.
     {
@@ -296,9 +307,9 @@ fn tile_reorder_round_trips_through_save_and_reopen() {
         });
         let mut model = LauncherModel::new(wm);
         model.dirs = vec![dir.path().to_path_buf()];
-        model.seed(&icedtea_config::LauncherConfig {
+        model.seed(&icedtea_registry_schema::LauncherConfig {
             pinned: Vec::new(),
-            tile_groups: vec![icedtea_config::TileGroup {
+            tile_groups: vec![icedtea_registry_schema::TileGroup {
                 name: "Web".to_string(),
                 ids: vec![
                     "firefox".to_string(),
@@ -310,9 +321,9 @@ fn tile_reorder_round_trips_through_save_and_reopen() {
             recency: std::collections::HashMap::new(),
         });
         model.open();
-        let path = db_path.clone();
+        let reg = registry.clone();
         model.on_persist = Some(Rc::new(move |cfg| {
-            persist_launcher_config(&path, &cfg).expect("test write-back")
+            persist_launcher_config(&reg, &cfg).expect("test write-back")
         }));
         let _ = launcher_view::update(
             &mut model,
@@ -324,7 +335,7 @@ fn tile_reorder_round_trips_through_save_and_reopen() {
         let _ = launcher_view::update(&mut model, LauncherMsg::Close);
     }
 
-    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    let stored = icedtea_registry_schema::Config::load_or_default(&registry).launcher;
     let web = stored
         .tile_groups
         .iter()
@@ -395,7 +406,7 @@ fn open_type_launch_reaches_the_compositor_and_records_recency() {
 
     let dir = app_dir();
     let db_dir = TempDir::new("launcher-launch-e2e");
-    let db_path = db_dir.path().join("cfg.redb");
+    let registry = direct_registry(&db_dir);
 
     let wm = Rc::new(MockWm {
         spawns: RefCell::new(Vec::new()),
@@ -404,9 +415,9 @@ fn open_type_launch_reaches_the_compositor_and_records_recency() {
     let mut model = LauncherModel::new(wm.clone());
     model.dirs = vec![dir.path().to_path_buf()];
     model.open();
-    let path = db_path.clone();
+    let reg = registry.clone();
     model.on_persist = Some(Rc::new(move |cfg| {
-        persist_launcher_config(&path, &cfg).expect("test write-back")
+        persist_launcher_config(&reg, &cfg).expect("test write-back")
     }));
 
     let clock = Rc::new(ManualClock::new());
@@ -451,7 +462,7 @@ fn open_type_launch_reaches_the_compositor_and_records_recency() {
         "typing 'mus' then Enter launches Music"
     );
     // The success closed the menu, and the close persisted the recency.
-    let stored = icedtea_config::load_or_default(&db_path).launcher;
+    let stored = icedtea_registry_schema::Config::load_or_default(&registry).launcher;
     assert_eq!(
         stored.recency.get("music").map(|(count, _)| *count),
         Some(1),

@@ -1397,9 +1397,10 @@ dependencies = [
  "bitflags 2.13.1",
  "cosmic-text",
  "crossbeam-channel",
- "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-registry",
+ "icedtea-registry-schema",
  "icedtea-shell",
  "image",
  "rustix 1.1.4",
@@ -1418,19 +1419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "icedtea-config"
-version = "0.1.0"
-dependencies = [
- "icedtea-contract",
- "redb",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "xkbcommon 0.8.0",
-]
-
-[[package]]
 name = "icedtea-contract"
 version = "0.1.0"
 dependencies = [
@@ -1446,8 +1434,8 @@ dependencies = [
  "crossbeam-channel",
  "gbm",
  "icedtea-compositor",
- "icedtea-config",
  "icedtea-contract",
+ "icedtea-registry-schema",
  "rustix 1.1.4",
  "wayland-client",
  "wayland-protocols",
@@ -1469,14 +1457,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "icedtea-registry"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
+name = "icedtea-registry-cli"
+version = "0.1.0"
+dependencies = [
+ "icedtea-registry",
+ "icedtea-registry-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "icedtea-registry-schema"
+version = "0.1.0"
+dependencies = [
+ "icedtea-contract",
+ "icedtea-registry",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "xkbcommon 0.9.0",
+]
+
+[[package]]
+name = "icedtea-registryd"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "icedtea-registry",
+ "icedtea-registry-schema",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "icedtea-session"
 version = "0.1.0"
 dependencies = [
  "futures-util",
  "icedtea-compositor",
- "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-registry",
+ "icedtea-registry-schema",
  "rustix 1.1.4",
  "tempfile",
  "tracing",
@@ -1493,9 +1531,10 @@ dependencies = [
  "async-channel",
  "crossbeam-channel",
  "futures-util",
- "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
+ "icedtea-registry",
+ "icedtea-registry-schema",
  "icedtea-ui",
  "redb",
  "rustix 1.1.4",
@@ -1517,10 +1556,11 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "icedtea-clipboard",
- "icedtea-config",
  "icedtea-contract",
  "icedtea-harness",
  "icedtea-notifications",
+ "icedtea-registry",
+ "icedtea-registry-schema",
  "icedtea-settings",
  "icedtea-ui",
  "jiff",

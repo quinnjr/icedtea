@@ -19,7 +19,10 @@ wrapper over wlroots 0.20.
 | `icedtea-shell` | Shell surfaces (taskbar) driving the compositor over D-Bus. |
 | `icedtea-ui` | Pure-Rust, GTK4-theme-compatible widget toolkit shared by settings and shell: CSS engine, layout, widgets, reactive view layer (no GTK). |
 | `icedtea-contract` | Shared IPC vocabulary (D-Bus names, wire types) every component depends on. |
-| `icedtea-config` | Configuration model. |
+| `icedtea-registry` | The hierarchical, typed, live-notifying registry: value model, redb store, `org.icedtea.Registry` client and daemon interface. |
+| `icedtea-registry-schema` | The first-party schema union, typed domain structs, and the one-shot `config.redb` importer. |
+| `icedtea-registryd` | The registry broker daemon — sole opener of `registry.redb`. |
+| `icedtea-registry-cli` | The generic `registry` CLI (`get/set/list/watch/dump/load/spec`). |
 | `icedtea-harness` | Test harness that boots a headless compositor and drives it as a real Wayland/D-Bus client. |
 
 ## Status
