@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// `cargo test -p icedtea-compositor --test xwayland` at any `--test-threads`.
 /// The remaining sensitivity is to *cross-binary* CPU contention (a full
 /// `cargo test -p icedtea-compositor` runs this binary alongside the others),
-/// which only slows a boot, never corrupts one; the generous [`MAP_TIMEOUT`]
+/// which only slows a boot, never corrupts one; the generous [`map_timeout`]
 /// below absorbs that. Poisoning is ignored: a panicking test must not cascade
 /// into spurious failures of the rest.
 static X11_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -50,7 +50,23 @@ static X11_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// are serialized (see [`X11_TEST_LOCK`]) only one boot is ever in flight, so a
 /// long ceiling costs nothing on the happy path — a mapped window is observed in
 /// well under a second — and only ever bites a genuinely stuck one.
-const MAP_TIMEOUT: Duration = Duration::from_secs(30);
+/// `ICEDTEA_HARNESS_TIMEOUT_SECS` overrides the base budget, so a saturated
+/// host (a whole-workspace `cargo test` with many binaries in flight) can be
+/// given more room without editing the suite; the floor stays the historical
+/// generous 30 s.
+fn map_timeout() -> Duration {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<Duration> = OnceLock::new();
+    *ONCE.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("ICEDTEA_HARNESS_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+                .max(30),
+        )
+    })
+}
 
 fn x11_test_guard() -> MutexGuard<'static, ()> {
     X11_TEST_LOCK
@@ -202,7 +218,7 @@ fn one_managed_x11_window_maps_into_the_window_model() {
     conn.flush().expect("flush X11 requests");
 
     // Poll the model until the managed X11 window shows up, then assert on it.
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the compositor's window model");
 
     assert_eq!(
@@ -308,7 +324,7 @@ fn managed_x11_window_is_first_class() {
     conn.flush().expect("flush");
 
     // (1) It enters the model as one managed window with the right identity.
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the compositor's window model");
     assert_eq!(window.app_id, WINDOW_CLASS, "app_id is the WM_CLASS class");
     assert_eq!(window.title, WINDOW_TITLE, "title is the X11 window name");
@@ -439,7 +455,7 @@ fn fullscreen_x11_window_fills_the_output_without_ssd() {
     const REQUESTED_H: u16 = 300;
     const FRAME_H: i32 = REQUESTED_H as i32 + TITLE_BAR_HEIGHT as i32;
     let win = map_managed_x11(&conn, &screen, REQUESTED_W, REQUESTED_H);
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     // Baseline: decorated, so the client keeps its requested content size.
@@ -536,7 +552,7 @@ fn minimize_x11_window_hides_it_and_reaches_the_surface() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     // It starts focused (freshly mapped, autofocused).
@@ -612,7 +628,7 @@ fn interactive_move_via_net_wm_moveresize_moves_the_window() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     let id = window.id;
 
@@ -708,7 +724,7 @@ fn raising_a_managed_x11_window_restacks_it_above_the_other() {
 
     // A maps first and is the only window.
     let win_a = map_managed_x11(&conn, &screen, 300, 200);
-    let a = poll_for_window(&comp, MAP_TIMEOUT).expect("window A never entered the model");
+    let a = poll_for_window(&comp, map_timeout()).expect("window A never entered the model");
     let a_id = a.id;
 
     // B maps second, on top; wait until the model holds both, then take the id
@@ -829,7 +845,7 @@ fn wm_initiated_close_reaches_the_x11_client() {
     conn.map_window(win).expect("map X11 window");
     conn.flush().expect("flush");
 
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     let id = window.id;
 
@@ -874,7 +890,7 @@ fn live_title_and_class_updates_reach_the_model() {
     let screen = conn.setup().roots[screen_num].clone();
 
     let win = map_managed_x11(&conn, &screen, 400, 300);
-    let window = poll_for_window(&comp, MAP_TIMEOUT)
+    let window = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     let id = window.id;
     assert_eq!(window.app_id, WINDOW_CLASS, "baseline app_id");
@@ -959,7 +975,7 @@ fn override_redirect_popup_is_an_unmanaged_placed_focused_pop_up() {
     // A managed toplevel first, so there is a real managed window in the
     // `Band::Toplevel` band for the OR pop-up to stack above.
     let managed = map_managed_x11(&conn, screen, 400, 300);
-    let base = poll_for_window(&comp, MAP_TIMEOUT)
+    let base = poll_for_window(&comp, map_timeout())
         .expect("the managed X11 window never entered the model");
     assert_eq!(base.app_id, WINDOW_CLASS);
 
@@ -1050,8 +1066,8 @@ fn managed_transient_dialog_is_centered_over_its_parent() {
 
     // The parent, mapped and placed by the WM.
     let parent = map_managed_x11(&conn, screen, 600, 500);
-    let parent_win =
-        poll_for_window(&comp, MAP_TIMEOUT).expect("the parent X11 window never entered the model");
+    let parent_win = poll_for_window(&comp, map_timeout())
+        .expect("the parent X11 window never entered the model");
     let parent_geo = parent_win.geometry;
 
     // The dialog: transient for the parent, typed as a dialog, distinct title so
@@ -1156,8 +1172,8 @@ fn runtime_override_redirect_flip_migrates_between_managed_and_or() {
 
     // Start managed.
     let win = map_managed_x11(&conn, screen, 300, 200);
-    let modelled =
-        poll_for_window(&comp, MAP_TIMEOUT).expect("the window never entered the model as managed");
+    let modelled = poll_for_window(&comp, map_timeout())
+        .expect("the window never entered the model as managed");
     assert_eq!(comp.snapshot().windows.len(), 1);
     assert!(comp.xwayland_override_redirect().is_empty(), "not OR yet");
     let _ = modelled;
@@ -2312,7 +2328,7 @@ fn map_focused_managed_x11(
     screen: &x11rb::protocol::xproto::Screen,
 ) -> u32 {
     let win = map_managed_x11(conn, screen, 200, 150);
-    let window = poll_for_window(comp, MAP_TIMEOUT)
+    let window = poll_for_window(comp, map_timeout())
         .expect("the focus-holding managed X11 window never entered the model");
     assert!(
         poll_snapshot_window(comp, window.id, Duration::from_secs(10), |w| w.focused).is_some(),

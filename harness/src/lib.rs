@@ -129,8 +129,33 @@ pub use wayland_protocols::xdg::shell::client::xdg_positioner::{
 };
 
 /// How long any "wait for the compositor to do a thing" helper waits before
-/// declaring the harness broken.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// declaring the harness broken, in seconds.
+///
+/// `ICEDTEA_HARNESS_TIMEOUT_SECS` overrides it: on a saturated host (several
+/// test binaries built and run at once) a handshake that normally takes
+/// milliseconds can exceed a fixed budget, and a too-tight timeout reports a
+/// working compositor as broken.
+fn harness_timeout_secs() -> u64 {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<u64> = OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("ICEDTEA_HARNESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15)
+    })
+}
+
+/// The default wait for "the compositor did a thing".
+fn timeout() -> Duration {
+    Duration::from_secs(harness_timeout_secs())
+}
+
+/// How long the *boot handshake* waits for the compositor thread to come up.
+/// Longer than [`timeout`]; see [`harness_timeout_secs`].
+fn boot_timeout() -> Duration {
+    Duration::from_secs(harness_timeout_secs().max(60))
+}
 
 /// Size the client falls back to when the compositor's configure carries no
 /// size of its own (0x0 means "you pick").
@@ -484,7 +509,7 @@ impl Compositor {
         });
 
         let (socket, wake) = boot_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(boot_timeout())
             .expect("compositor thread never completed its boot handshake");
 
         Compositor {
@@ -527,7 +552,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::GetState(reply_tx));
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered GetState")
     }
 
@@ -540,7 +565,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::XwaylandDisplay { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered XwaylandDisplay")
     }
 
@@ -553,7 +578,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::XwaylandReady { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered XwaylandReady")
     }
 
@@ -567,7 +592,7 @@ impl Compositor {
         // exists. Poll until the compositor reports it actually recorded the
         // scale (review finding #11) rather than acking a silent no-op, so the
         // caller is guaranteed the scale is live before it proceeds.
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout();
         loop {
             let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
             self.send(DbCommand::SetOutputScaleForTest {
@@ -575,7 +600,7 @@ impl Compositor {
                 reply: reply_tx,
             });
             let recorded = reply_rx
-                .recv_timeout(TIMEOUT)
+                .recv_timeout(timeout())
                 .expect("compositor never answered SetOutputScaleForTest");
             if recorded {
                 return;
@@ -598,7 +623,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::XwaylandOverrideRedirect { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered XwaylandOverrideRedirect")
     }
 
@@ -617,7 +642,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectTouchDown")
     }
 
@@ -633,7 +658,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectTouchMotion");
     }
 
@@ -647,7 +672,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectTouchUp");
     }
 
@@ -660,7 +685,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::InjectTouchCancel { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectTouchCancel");
     }
 
@@ -676,7 +701,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectGesture");
     }
 
@@ -692,7 +717,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InjectSwitchToggle");
     }
 
@@ -704,7 +729,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::DragIconPosition { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered DragIconPosition")
     }
 
@@ -715,7 +740,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::PopupsDismissed { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered PopupsDismissed")
     }
 
@@ -726,7 +751,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::SessionLocked { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered SessionLocked")
     }
 
@@ -737,7 +762,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::InputMethodActive { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InputMethodActive")
     }
 
@@ -747,7 +772,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::CursorPosition { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered CursorPosition")
     }
 
@@ -758,7 +783,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::InputPopupPosition { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InputPopupPosition")
     }
 
@@ -770,7 +795,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::InputPopupNode { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered InputPopupNode")
     }
 
@@ -783,7 +808,7 @@ impl Compositor {
             reply: reply_tx,
         });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered SceneNodePosition")
     }
 
@@ -795,14 +820,14 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::PreeditOverlay { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered PreeditOverlay")
     }
 
     /// Poll `preedit_overlay()` until `pred` accepts or `TIMEOUT` elapses,
     /// mirroring `TestClient::wait_until` but for the compositor oracle.
     pub fn wait_until_preedit_overlay(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout();
         loop {
             let v = self.preedit_overlay();
             if pred(v) {
@@ -818,7 +843,7 @@ impl Compositor {
     /// Poll `input_popup_position()` until `pred` accepts or `TIMEOUT`
     /// elapses.
     pub fn wait_until_popup_position(&self, pred: impl Fn(Option<(i32, i32)>) -> bool) -> bool {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout();
         loop {
             let v = self.input_popup_position();
             if pred(v) {
@@ -843,7 +868,7 @@ impl Compositor {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.send(DbCommand::CursorShape { reply: reply_tx });
         reply_rx
-            .recv_timeout(TIMEOUT)
+            .recv_timeout(timeout())
             .expect("compositor never answered CursorShape")
     }
 
@@ -859,12 +884,12 @@ impl Compositor {
     /// `run_all` has created the headless output (the same race
     /// [`Self::set_output_scale_for_test`] documents).
     pub fn output_size(&self) -> (i32, i32) {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout();
         loop {
             let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
             self.send(DbCommand::OutputSize { reply: reply_tx });
             let geo = reply_rx
-                .recv_timeout(TIMEOUT)
+                .recv_timeout(timeout())
                 .expect("compositor never answered OutputSize");
             if let Some(geo) = geo {
                 assert!(
@@ -906,7 +931,7 @@ impl Compositor {
     /// because nothing a test asserts on depends on it (the sequence
     /// contract itself is `contract`'s own unit tests' job).
     pub fn wait_event(&self, pred: impl Fn(&Event) -> bool) -> Event {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         let mut seen: Vec<Event> = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2865,11 +2890,12 @@ fn map_empty_toplevel(
     // output instead of a 5s assertion failure. A roundtrip's own
     // `wl_display.sync` reply is guaranteed by any live loop, so the
     // deadline stays honest.
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout();
     while state.configures == 0 {
         assert!(
             Instant::now() < deadline,
-            "no xdg_surface.configure within {TIMEOUT:?}"
+            "no xdg_surface.configure within {:?}",
+            timeout()
         );
         queue.roundtrip(state).expect("configure roundtrip");
     }
@@ -2920,11 +2946,12 @@ pub fn read_selection(reader: &mut TestClient, owner: &mut TestClient, mime: &st
     // payload and dropped its fd). Deadline-guarded so a wedged transfer fails
     // rather than hangs.
     let before = owner.state.source_sends;
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout();
     while owner.state.source_sends == before {
         assert!(
             Instant::now() < deadline,
-            "the selection owner never serviced a data_source.send within {TIMEOUT:?}"
+            "the selection owner never serviced a data_source.send within {:?}",
+            timeout()
         );
         owner.pump();
         reader.pump();
@@ -2954,11 +2981,12 @@ pub fn read_drag_offer(dst: &mut TestClient, src: &mut TestClient, mime: &str) -
     drop(write_end);
 
     let before = src.state.source_sends;
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout();
     while src.state.source_sends == before {
         assert!(
             Instant::now() < deadline,
-            "the drag source never serviced a data_source.send within {TIMEOUT:?}"
+            "the drag source never serviced a data_source.send within {:?}",
+            timeout()
         );
         src.pump();
         dst.pump();
@@ -2989,11 +3017,12 @@ pub fn read_primary(reader: &mut TestClient, owner: &mut TestClient, mime: &str)
     drop(write_end);
 
     let before = owner.state.source_sends;
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout();
     while owner.state.source_sends == before {
         assert!(
             Instant::now() < deadline,
-            "the primary owner never serviced a send within {TIMEOUT:?}"
+            "the primary owner never serviced a send within {:?}",
+            timeout()
         );
         owner.pump();
         reader.pump();
@@ -3023,11 +3052,12 @@ pub fn read_selection_from_data_control(
     drop(write_end);
 
     let before = owner.source_sends();
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout();
     while owner.source_sends() == before {
         assert!(
             Instant::now() < deadline,
-            "the data-control owner never serviced a send within {TIMEOUT:?}"
+            "the data-control owner never serviced a send within {:?}",
+            timeout()
         );
         owner.pump();
         reader.pump();
@@ -3321,7 +3351,7 @@ impl TestClient {
     /// compositor that has nothing to say, turning a failed assertion into a
     /// hung test.
     pub fn wait_until(&mut self, pred: impl Fn(&TestClient) -> bool) -> bool {
-        self.wait_until_timeout(TIMEOUT, pred)
+        self.wait_until_timeout(timeout(), pred)
     }
 
     /// As [`Self::wait_until`], but with an explicit timeout rather than
@@ -3630,11 +3660,12 @@ impl TestClient {
         // `roundtrip`, not `blocking_dispatch`, for the reason `map` gives:
         // a roundtrip always returns, so the deadline stays honest against a
         // compositor that has nothing to say.
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while !(self.state.popup_acked[depth] && self.state.popup_geometries[depth].is_some()) {
             assert!(
                 Instant::now() < deadline,
-                "no xdg_popup.configure + xdg_surface.configure within {TIMEOUT:?}"
+                "no xdg_popup.configure + xdg_surface.configure within {:?}",
+                timeout()
             );
             self.queue
                 .roundtrip(&mut self.state)
@@ -4019,7 +4050,8 @@ impl TestClient {
         self.conn.flush().expect("flush token commit");
         assert!(
             self.wait_until(|c| c.state.activation_token.is_some()),
-            "no xdg_activation_token_v1.done arrived within {TIMEOUT:?}"
+            "no xdg_activation_token_v1.done arrived within {:?}",
+            timeout()
         );
         self.state
             .activation_token
@@ -4275,11 +4307,12 @@ impl LayerPanelClient {
         surface.commit();
         conn.flush().expect("flush");
 
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while state.layer_configured.is_none() {
             assert!(
                 Instant::now() < deadline,
-                "no zwlr_layer_surface_v1.configure within {TIMEOUT:?}"
+                "no zwlr_layer_surface_v1.configure within {:?}",
+                timeout()
             );
             queue.roundtrip(&mut state).expect("configure roundtrip");
         }
@@ -4316,7 +4349,7 @@ impl LayerPanelClient {
     /// Pump the client queue until `pred(self)` holds or `TIMEOUT`
     /// elapses. Mirrors [`TestClient::wait_until`] exactly.
     pub fn wait_until(&mut self, pred: impl Fn(&LayerPanelClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -4446,11 +4479,12 @@ impl LayerPanelClient {
         surface.commit();
         self.conn.flush().expect("flush panel popup create");
 
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while !(self.state.popup_acked[0] && self.state.popup_geometries[0].is_some()) {
             assert!(
                 Instant::now() < deadline,
-                "no popup configure for a layer-shell popup within {TIMEOUT:?}"
+                "no popup configure for a layer-shell popup within {:?}",
+                timeout()
             );
             self.queue
                 .roundtrip(&mut self.state)
@@ -4949,7 +4983,7 @@ impl DataControlClient {
             let _ = read_end.read_to_end(&mut buf);
             buf
         });
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if handle.is_finished() {
                 return handle.join().expect("read thread panicked");
@@ -4964,7 +4998,7 @@ impl DataControlClient {
 
     /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
     pub fn wait_until(&mut self, pred: impl Fn(&DataControlClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -5011,7 +5045,7 @@ impl DataControlClient {
             let _ = read_end.read_to_end(&mut buf);
             buf
         });
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if handle.is_finished() {
                 return handle.join().expect("read thread panicked");
@@ -5044,11 +5078,12 @@ impl DataControlClient {
         drop(write_end);
 
         let before = owner.source_sends();
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while owner.source_sends() == before {
             assert!(
                 Instant::now() < deadline,
-                "the wl_data_device owner never serviced a send within {TIMEOUT:?}"
+                "the wl_data_device owner never serviced a send within {:?}",
+                timeout()
             );
             owner.pump();
             self.pump();
@@ -5075,11 +5110,12 @@ impl DataControlClient {
         drop(write_end);
 
         let before = owner.state.source_sends;
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while owner.state.source_sends == before {
             assert!(
                 Instant::now() < deadline,
-                "the data-control owner never serviced a send within {TIMEOUT:?}"
+                "the data-control owner never serviced a send within {:?}",
+                timeout()
             );
             owner.pump();
             self.pump();
@@ -5153,7 +5189,7 @@ impl SessionLockClient {
 
         // Pump until the lock surface's configure has round-tripped through
         // (ack + attach + commit happen inside its own Dispatch handler).
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while self
             .state
             .lock_surfaces
@@ -5169,7 +5205,7 @@ impl SessionLockClient {
     /// Pump until the `locked` event arrives, bounded by `TIMEOUT`. Returns
     /// whether it did.
     pub fn wait_locked(&mut self) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while !self.state.session_locked {
             if Instant::now() >= deadline {
                 return false;
@@ -5280,7 +5316,7 @@ impl IdleNotifyClient {
     /// timeouts these tests request) until `idled` arrives. Returns whether
     /// it did.
     pub fn wait_idled(&mut self) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while !self.state.idle_idled {
             if Instant::now() >= deadline {
                 return false;
@@ -5293,7 +5329,7 @@ impl IdleNotifyClient {
 
     /// As [`Self::wait_idled`], for `resumed`.
     pub fn wait_resumed(&mut self) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while !self.state.idle_resumed {
             if Instant::now() >= deadline {
                 return false;
@@ -5492,7 +5528,7 @@ impl ShortcutsInhibitClient {
     /// Pump until `pred` accepts or the harness `TIMEOUT` elapses, mirroring
     /// [`TestClient::wait_until`] for this wrapper's own state.
     pub fn wait_until(&mut self, pred: impl Fn(&ShortcutsInhibitClient) -> bool) -> bool {
-        let deadline = std::time::Instant::now() + crate::TIMEOUT;
+        let deadline = std::time::Instant::now() + crate::timeout();
         loop {
             self.pump();
             if pred(self) {
@@ -5765,7 +5801,7 @@ impl TouchClient {
     /// Pump until `pred` holds or `TIMEOUT` lapses (mirrors
     /// [`TestClient::wait_until`).
     pub fn wait_until(&mut self, pred: impl Fn(&TouchClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -5900,7 +5936,7 @@ impl PointerClient {
     /// Pump until `pred` holds or `TIMEOUT` lapses (mirrors
     /// [`TestClient::wait_until`).
     pub fn wait_until(&mut self, pred: impl Fn(&PointerClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -6048,7 +6084,7 @@ impl TextInputClient {
 
     /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
     pub fn wait_until(&mut self, pred: impl Fn(&TextInputClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -6285,7 +6321,7 @@ impl InputMethodClient {
 
     /// Pump the queue until `pred` holds or `TIMEOUT` elapses.
     pub fn wait_until(&mut self, pred: impl Fn(&InputMethodClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -6388,7 +6424,7 @@ impl GammaControlClient {
     /// [`TestClient::wait_until`] is one -- the deadline stays honest even
     /// against a compositor that has nothing to say.
     pub fn wait_until(&mut self, pred: impl Fn(&GammaControlClient) -> bool) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -7142,7 +7178,7 @@ impl DmabufClient {
     /// naming the error rather than spinning silently to the timeout.
     fn pump_until(&mut self, pred: impl Fn(&Self) -> bool) -> bool {
         self.last_pump_errored = false;
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         loop {
             if pred(self) {
                 return true;
@@ -7281,11 +7317,12 @@ impl DmabufClient {
         if let Err(e) = self.conn.flush() {
             panic!("dmabuf create_params flush failed: {e}");
         }
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout();
         while self.state.dmabuf_buffer.is_none() && !self.state.dmabuf_failed {
             assert!(
                 Instant::now() < deadline,
-                "create_params neither created nor failed within {TIMEOUT:?}"
+                "create_params neither created nor failed within {:?}",
+                timeout()
             );
             if let Err(e) = self.queue.roundtrip(&mut self.state) {
                 panic!("dmabuf create_params roundtrip failed: {e}");

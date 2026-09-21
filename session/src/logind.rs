@@ -398,9 +398,13 @@ pub struct RecordingLogind {
     /// testable.
     pid_session_path: OwnedObjectPath,
     calls: Arc<Mutex<Vec<LogindCall>>>,
-    /// The write end of every pipe whose read end [`Logind::inhibit`] handed
+    /// The read end of every pipe whose *write* end [`Logind::inhibit`] handed
     /// out, so [`Self::live_inhibitors`] can tell whether the caller's guard
-    /// still holds it open.
+    /// still holds its end open. Read, never written: a non-blocking read
+    /// returns `0` (EOF) exactly when every write end is closed, which is
+    /// deterministic where probing the write side with `write_all` was not
+    /// (the OS may still buffer a write, and a sibling fd can keep the pipe
+    /// from ever reporting `EPIPE`).
     inhibitors: Arc<Mutex<Vec<File>>>,
     /// Optional `Lock` signal echo: invoked after recording a [`Logind::lock`]
     /// call, so a test can drive the single funnel (`LockFlow::on_lock`) the
@@ -470,12 +474,34 @@ impl RecordingLogind {
     }
 
     /// How many inhibitor fds [`Logind::inhibit`] handed out are still open.
-    /// The write end of each returned read-end pipe is retained; a write that
-    /// fails with `EPIPE` means the caller's guard has dropped and closed it.
+    /// The read end of each returned pipe is retained; a non-blocking read
+    /// reports EOF (`Ok(0)`) exactly when the caller's guard has dropped its
+    /// write end, so a closed guard is observed deterministically rather than
+    /// relying on a write-side probe.
     pub fn live_inhibitors(&self) -> usize {
-        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        // A pipe's read end reports `POLLHUP` exactly when every write end is
+        // closed, which is the guard-dropped state -- deterministic, unlike a
+        // write-side probe whose result depends on buffering and on whether
+        // any other copy of the fd is open.
         let mut live = self.inhibitors.lock().unwrap_or_else(|e| e.into_inner());
-        live.retain_mut(|write| write.write_all(&[0u8]).is_ok());
+        live.retain(|read| {
+            let borrowed = read.as_fd();
+            let mut fds = [rustix::event::PollFd::new(
+                &borrowed,
+                rustix::event::PollFlags::HUP,
+            )];
+            let zero = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            match rustix::event::poll(&mut fds, Some(&zero)) {
+                Ok(_) => !fds[0].revents().contains(rustix::event::PollFlags::HUP),
+                // A poll error is treated as "still held" so a broken probe
+                // cannot report a live guard as released.
+                Err(_) => true,
+            }
+        });
         live.len()
     }
 
@@ -517,14 +543,15 @@ impl Logind for RecordingLogind {
             mode,
         });
         let (read, write) = io::pipe()?;
-        // Keep the write end: `live_inhibitors` probes it to detect that the
-        // read end the caller holds has been closed.
-        let write: OwnedFd = write.into();
+        // Keep the *read* end and hand the caller the write end:
+        // `live_inhibitors` reads it and sees EOF once the guard's write end
+        // is closed, which is the deterministic direction (a write-side probe
+        // can be buffered and is defeated by any other copy of the fd).
         self.inhibitors
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(File::from(write));
-        Ok(read.into())
+            .push(File::from(OwnedFd::from(read)));
+        Ok(write.into())
     }
 
     fn lock(&self) -> io::Result<()> {
