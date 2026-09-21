@@ -11,7 +11,7 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 zbus.workspace = true
 futures-util = "0.3"
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "event", "fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
