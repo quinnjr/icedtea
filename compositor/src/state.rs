@@ -4586,6 +4586,15 @@ impl State {
     /// original alive on `State` (`set_wallpaper_wake`, called once at boot)
     /// closes that off the same way `config_reload_wake` already does for
     /// its own channel.
+    pub fn spawn_wallpaper(&mut self, path: Option<String>) {
+        let wake = self
+            .wallpaper_wake
+            .as_ref()
+            .and_then(|w| w.try_clone().ok());
+        let rx = crate::render::spawn_wallpaper_decode(path, wake);
+        self.wallpaper_rx = Some(rx);
+    }
+
     /// The wallpaper the current config resolves to, through the boot path's
     /// fallback chain (configured -> `ICEDTEA_DEFAULT_WALLPAPER` -> installed
     /// default -> none). Used by the reload path so a changed config is
@@ -4597,15 +4606,6 @@ impl State {
             std::env::var_os("ICEDTEA_DEFAULT_WALLPAPER").as_deref(),
             std::path::Path::new(crate::DEFAULT_WALLPAPER_PATH),
         )
-    }
-
-    pub fn spawn_wallpaper(&mut self, path: Option<String>) {
-        let wake = self
-            .wallpaper_wake
-            .as_ref()
-            .and_then(|w| w.try_clone().ok());
-        let rx = crate::render::spawn_wallpaper_decode(path, wake);
-        self.wallpaper_rx = Some(rx);
     }
 
     /// Central dispatcher for every [`crate::dbus::DbCommand`] received from
