@@ -242,7 +242,7 @@ mod tests {
         .expect("some pixels");
         assert_eq!(px.len(), 200 * 28 * 4);
         assert!(
-            px.chunks_exact(4).any(|p| p[3] != 0),
+            px.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
             "at least one glyph pixel must be opaque"
         );
     }
@@ -290,15 +290,18 @@ mod tests {
         )
         .expect("some pixels");
         let transparent = px
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .find(|p| p[3] == 0)
+            .copied()
             .expect("some pixel stays clear");
         assert_eq!(
             transparent,
             [0, 0, 0, 0],
             "a clear pixel must be fully zeroed"
         );
-        for p in px.chunks_exact(4) {
+        for p in px.as_chunks::<4>().0 {
             assert!(
                 p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3],
                 "channel exceeds alpha: {p:?} is not premultiplied"
@@ -330,7 +333,7 @@ mod tests {
         .expect("glyph");
         assert_eq!(px.len(), 40 * 28 * 4);
         assert!(
-            px.chunks_exact(4).any(|p| p[3] != 0),
+            px.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
             "glyph has opaque pixels"
         );
     }
@@ -370,7 +373,7 @@ mod tests {
         let mut left_opaque = false;
         let mut right_opaque = false;
         for row in px.chunks_exact(row_stride) {
-            for (x, p) in row.chunks_exact(4).enumerate() {
+            for (x, p) in row.as_chunks::<4>().0.iter().enumerate() {
                 if p[3] != 0 {
                     if x < width as usize / 4 {
                         left_opaque = true;
@@ -419,7 +422,14 @@ mod tests {
             [255, 255, 255, 153],
         )
         .expect("dim");
-        let max_a = |px: &[u8]| px.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+        let max_a = |px: &[u8]| {
+            px.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[3])
+                .max()
+                .unwrap_or(0)
+        };
         assert!(
             max_a(&dim) < max_a(&full),
             "a lower-alpha fg yields lower-alpha glyph pixels"

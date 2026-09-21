@@ -4071,8 +4071,10 @@ impl State {
     pub fn apply_reloaded_config(&mut self, cfg: Config) -> Vec<Event> {
         // Captured before `apply_config` overwrites `self.config` -- this is
         // the only way to tell whether the wallpaper *path* changed rather
-        // than merely being reapplied.
-        let old_wallpaper = self.config.appearance.wallpaper.clone();
+        // than merely being reapplied. Resolved through the same fallback the
+        // boot path uses, so a clear (Some -> None) is compared and spawned as
+        // the installed default, not as `None` (which would go flat).
+        let old_wallpaper = self.resolved_wallpaper();
 
         let events = self.apply_config(cfg);
         // Review finding I2: these used to be extended onto a separate
@@ -4100,7 +4102,8 @@ impl State {
         {
             runtime.set_rect_color(bg, render::wallpaper_color(&self.config.appearance));
         }
-        if self.config.appearance.wallpaper != old_wallpaper {
+        let new_wallpaper = self.resolved_wallpaper();
+        if new_wallpaper != old_wallpaper {
             // Carried-forward obligation (task 7 review): clear the decoded
             // image and tear down every wallpaper node *before* the fresh
             // decode can land, so `sync_wallpaper_nodes`'s existing-node
@@ -4108,8 +4111,7 @@ impl State {
             // doc) is never asked to show stale pixels under a new path.
             self.wallpaper.set_decoded(None);
             self.sync_wallpaper_nodes();
-            let path = self.config.appearance.wallpaper.clone();
-            self.spawn_wallpaper(path);
+            self.spawn_wallpaper(new_wallpaper);
         }
         // `apply_config` now preserves every window row across the reload, so
         // this re-sync repaints the surviving windows against the swapped-in
@@ -4531,6 +4533,19 @@ impl State {
             .and_then(|w| w.try_clone().ok());
         let rx = crate::render::spawn_wallpaper_decode(path, wake);
         self.wallpaper_rx = Some(rx);
+    }
+
+    /// The wallpaper the current config resolves to, through the boot path's
+    /// fallback chain (configured -> `ICEDTEA_DEFAULT_WALLPAPER` -> installed
+    /// default -> none). Used by the reload path so a changed config is
+    /// compared and spawned on the *resolved* value, not the raw
+    /// `Appearance.wallpaper`.
+    fn resolved_wallpaper(&self) -> Option<String> {
+        crate::resolve_wallpaper(
+            self.config.appearance.wallpaper.as_deref(),
+            std::env::var_os("ICEDTEA_DEFAULT_WALLPAPER").as_deref(),
+            std::path::Path::new(crate::DEFAULT_WALLPAPER_PATH),
+        )
     }
 
     /// Central dispatcher for every [`crate::dbus::DbCommand`] received from
@@ -8608,7 +8623,7 @@ impl State {
         // already scaled by the alpha, which is what the scene graph
         // composites.
         const BG: [u8; 4] = [17, 17, 17, 220];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             if p[3] == 0 {
                 p.copy_from_slice(&BG);
             }
@@ -8858,6 +8873,31 @@ impl wlr::SeatHandler for State {
             return;
         };
         self.apply_switch_toggle(state.switch_type, state.on);
+    }
+
+    /// A tablet tool did something (M8): notification only, currently
+    /// unforwarded. The id is opaque -- the crate exposes no per-tool state
+    /// readers -- and client delivery would require driving
+    /// `wlr_send_tablet_v2_*`, for which no safe wrapper exists yet (see
+    /// the crate's `emit_tablet_tool_event`: wlroots forwards nothing
+    /// itself). So this logs at debug and emits nothing for now;
+    /// tablet-aware clients do NOT yet receive tool traffic -- only cursor
+    /// motion, which arrives because the crate attaches every input device
+    /// to the cursor. A dangling id is harmless by construction (see
+    /// `tablet_notifications_without_a_runtime_emit_nothing`).
+    fn tablet_tool_event(&mut self, _id: wlr::TabletToolId) {
+        tracing::debug!("tablet tool notification with no per-tool state to read; ignoring");
+    }
+
+    /// A tablet pad did something -- button, ring or strip (M8): same terms
+    /// as [`SeatHandler::tablet_tool_event`]. Pad feedback flows through the
+    /// pad's grabs only when driven by the compositor, and no safe wrapper
+    /// exists yet either -- so, like tool traffic, pad traffic does NOT yet
+    /// reach tablet-aware clients. The pad id names hardware this model
+    /// never addresses, so this logs at debug and emits nothing, and a
+    /// dangling id is harmless by construction.
+    fn tablet_pad_event(&mut self, _id: wlr::TabletPadId) {
+        tracing::debug!("tablet pad notification with no per-pad state to read; ignoring");
     }
 
     /// Track `wlr::Runtime::is_session_locked` locally so this model stops
@@ -16519,6 +16559,27 @@ mod tests {
         assert!(
             !state.session_locked,
             "a switch must never drive the session lock flag"
+        );
+    }
+
+    /// M8: tablet tool/pad notifications without a runtime stay silent --
+    /// the ids are opaque (no per-tool state readers on the crate side) and
+    /// wlroots forwards no tool/pad traffic itself (delivery needs
+    /// compositor-driven `wlr_send_tablet_v2_*`, no safe wrapper yet), so
+    /// there is nothing truthful to do here; guessing would only invent
+    /// behavior. Dangling ids must be harmless.
+    #[test]
+    fn tablet_notifications_without_a_runtime_emit_nothing() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut state = State::new(default_config(), tx);
+        wlr::SeatHandler::tablet_tool_event(
+            &mut state,
+            wlr::TabletToolId::dangling_nth_for_test(0),
+        );
+        wlr::SeatHandler::tablet_pad_event(&mut state, wlr::TabletPadId::dangling_nth_for_test(0));
+        assert!(
+            rx.try_recv().is_err(),
+            "tablet notifications must stay silent"
         );
     }
 

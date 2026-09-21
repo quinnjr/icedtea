@@ -1,0 +1,17 @@
+[Unit]
+Description=icedtea session: publish WAYLAND_DISPLAY
+Documentation=https://github.com/quinnjr/icedtea
+After=icedtea-compositor.service
+Requires=icedtea-compositor.service
+# A compositor restart propagates to this publisher (PartOf=), which re-waits
+# for the (possibly new) socket and re-publishes; ExecStop clears the old
+# value first so a stale WAYLAND_DISPLAY cannot survive.
+PartOf=icedtea-compositor.service
+Before=icedtea-clipboard.service icedtea-session.service icedtea-shell.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/env icedtea-wait wayland-env
+ExecStop=-/usr/bin/env systemctl --user unset-environment WAYLAND_DISPLAY

@@ -1,0 +1,15 @@
+[Unit]
+Description=icedtea compositor (Wayland/DRM)
+Documentation=https://github.com/quinnjr/icedtea
+# The session target hard-Requires this unit, so its exit stops the session;
+# its own restart policy drives recovery.
+Before=icedtea-wayland-env.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/env icedtea-compositor
+Restart=on-failure
+RestartSec=1

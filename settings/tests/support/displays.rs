@@ -184,6 +184,9 @@ pub struct SettingsDriver {
     /// decoration drawn above the client area. Added to every window-local
     /// coordinate `alloc`/`point` hands back before it reaches a caller.
     origin: (i32, i32),
+    /// The window's compositor-assigned size, so a gate can assert a widget is
+    /// not pushed past the visible right/bottom edge.
+    window_size: (i32, i32),
 }
 
 impl SettingsDriver {
@@ -257,9 +260,12 @@ impl SettingsDriver {
             boot_background,
             page_root: page.to_string(),
             origin: (0, 0),
+            window_size: (0, 0),
         };
         driver.wait_for_first_frame();
-        driver.origin = driver.wait_for_window_origin();
+        let (origin, size) = driver.wait_for_window_origin();
+        driver.origin = origin;
+        driver.window_size = size;
         driver
     }
 
@@ -269,7 +275,7 @@ impl SettingsDriver {
     ///
     /// If the settings window never enters the compositor's model within
     /// [`BOOT`].
-    fn wait_for_window_origin(&self) -> (i32, i32) {
+    fn wait_for_window_origin(&self) -> ((i32, i32), (i32, i32)) {
         let started = Instant::now();
         while started.elapsed() < BOOT {
             if let Some(window) = self
@@ -280,11 +286,18 @@ impl SettingsDriver {
                 .find(|w| w.app_id == SETTINGS_APP_ID)
             {
                 let g = window.geometry;
-                return (g.x, g.y + TITLE_BAR_HEIGHT);
+                return ((g.x, g.y + TITLE_BAR_HEIGHT), (g.width, g.height));
             }
             std::thread::sleep(POLL);
         }
         panic!("the settings window never entered the compositor's model within {BOOT:?}");
+    }
+
+    /// The right edge of the window's frame, in output coordinates: a widget
+    /// whose `alloc` right edge exceeds this is clipped by the surface.
+    #[must_use]
+    pub fn window_right(&self) -> i32 {
+        self.origin.0 + self.window_size.0
     }
 
     /// Block until anything paints over the background.
@@ -486,6 +499,38 @@ impl SettingsDriver {
             std::thread::sleep(POLL);
         }
         false
+    }
+
+    /// Wait for the model's dirty state to *change from* `before` and return
+    /// the new state: `Some(true)` for dirty (`Unsaved changes`), `Some(false)`
+    /// for clean (`""`), `None` if it never changed.
+    ///
+    /// This is the signal a **toggle** must wait on, rather than polling for a
+    /// fixed status target: a switch alternates, and a click that lands is
+    /// only observable as a *transition*. Waiting for a fixed target cannot
+    /// tell "the click landed and made it clean" from "the click never
+    /// landed", which is exactly the parity the caller needs.
+    #[must_use]
+    pub fn wait_for_status_change(&self, before: &str, timeout: Duration) -> Option<bool> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let current = self
+                .lines()
+                .into_iter()
+                .rev()
+                .find_map(|l| l.strip_prefix("status ").map(str::to_owned))
+                .unwrap_or_default();
+            let current = current.trim();
+            if current != before {
+                return match current {
+                    "Unsaved changes" => Some(true),
+                    "" => Some(false),
+                    _ => None,
+                };
+            }
+            std::thread::sleep(POLL);
+        }
+        None
     }
 
     /// Poll until `key` reads something other than `before`, and return it.

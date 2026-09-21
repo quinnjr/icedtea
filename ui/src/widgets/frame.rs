@@ -159,15 +159,14 @@ mod tests {
         // from FrameC makes the child overlap the border and the pixel one
         // in from the top edge stops being the border colour.
         //
-        // Reconciliation: `Container::Box`'s undocumented children centre
-        // in their parent with no per-child `ChildLayout`
-        // (`layout::Container::Box`'s doc comment), and `PropName::Halign`/
-        // `Vexpand` are accepted by `View` but nothing in `view::render`
-        // consumes them yet, so a bare `frame(..)` does not fill this
-        // surface the way the task text's `(0, 30)`/`(80, 40)` coordinates
-        // assume. The frame instead sizes to its content and lands centred;
-        // `(79, 15)`/`(79, 20)` are that same centred frame's own top border
-        // stroke and the background just inside it.
+        // Reconciliation: `Container::Box`'s children centre in their parent
+        // when they carry no per-child `ChildLayout`
+        // (`layout::Container::Box`'s doc comment). `PropName::Halign`/
+        // `Vexpand` are honored on a plain child now, but this frame requests
+        // neither, so it still sizes to its content and lands centred -- the
+        // centred *unaligned* base, not `Fill`; `(79, 15)`/`(79, 20)` are that
+        // same centred frame's own top border stroke and the background just
+        // inside it.
         let out = frames((), update, view, (160, 60), vec![ScriptStep::Capture]);
         let border = px(&out, 0, 79, 15);
         let interior = px(&out, 0, 79, 20);

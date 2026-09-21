@@ -1,0 +1,13 @@
+[Unit]
+Description=icedtea desktop session
+Documentation=https://github.com/quinnjr/icedtea
+# The compositor is the one hard dependency: a desktop without a compositor is
+# no session at all, so its exit stops the target. The other components are
+# only wanted, so a crashing shell cannot take the compositor down.
+Requires=icedtea-compositor.service
+Wants=icedtea-wayland-env.service
+Wants=icedtea-notifications.service
+Wants=icedtea-clipboard.service
+Wants=icedtea-session.service
+Wants=icedtea-shell.service
+After=icedtea-compositor.service

@@ -789,15 +789,20 @@ fn nav(m: &SettingsModel) -> View<Msg> {
 
 /// Status line plus Revert and Apply. Every value here is computed from the
 /// model — there is no dirty flag and no `Rc<dyn Fn()>` to call.
+///
+/// The action cluster leads and the status label takes the remaining width.
+/// The settings window is narrower than the nav switcher's min-content (the
+/// surface is 640px, the switcher needs ~670), so a trailing cluster sits
+/// partly off the surface and its hit target moves with the status text: a
+/// click read from a just-changed frame landed on Revert instead of Apply.
+/// Leading the cluster pins the buttons at a fixed, fully-visible position
+/// whatever the status says, and `hexpand` on the status keeps its text from
+/// shifting them.
 fn footer(m: &SettingsModel) -> View<Msg> {
     let dirty = m.is_dirty();
     box_(
         Orientation::Horizontal,
         [
-            label(footer_text(m))
-                .id("status")
-                .hexpand(true)
-                .halign(Align::Start),
             // Dirty is not enough: a worker that never started accepts the
             // request and never answers, so the button would stay live and
             // the footer would park on "Applying…" for the session. Revert
@@ -811,6 +816,10 @@ fn footer(m: &SettingsModel) -> View<Msg> {
                 .id("apply")
                 .sensitive(dirty && m.workers.reload_available())
                 .on_click(Msg::Apply),
+            label(footer_text(m))
+                .id("status")
+                .hexpand(true)
+                .halign(Align::Start),
         ],
     )
     .id("footer")

@@ -1,0 +1,16 @@
+[Unit]
+Description=icedtea clipboard daemon (org.icedtea.Clipboard)
+Documentation=https://github.com/quinnjr/icedtea
+After=icedtea-wayland-env.service
+Wants=icedtea-wayland-env.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+Environment=GDK_BACKEND=wayland
+ExecStartPre=/usr/bin/env icedtea-wait wayland
+ExecStart=/usr/bin/env icedtea-clipboard
+Restart=on-failure
+RestartSec=1

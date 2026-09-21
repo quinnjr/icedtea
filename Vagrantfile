@@ -9,12 +9,18 @@
 # Usage:
 #   vagrant up            # first boot: provisions + builds (takes a while)
 #   vagrant rsync         # push local source changes into the VM
-#   vagrant ssh -c 'cd icedtea-wm && cargo build --release'
-#   # then, in the VirtualBox GUI window (auto-logged-in tty1):
-#   icedtea               # starts the compositor on the VM's DRM device
+#   vagrant provision     # reinstall the session artifacts + rebuild
+#   vagrant/verify.sh     # screenshot-assert the desktop is up
 #
-# Click into the GUI window to give it keyboard/mouse; Host key (Right Ctrl
-# by default) releases the grab.
+# Boot lands on the wdm greeter; logging in runs the repo's own icedtea session
+# (`icedtea-session-start --wait` starts `icedtea-session.target`). There is no
+# launcher to run by hand. Click into the GUI window to give it keyboard/mouse;
+# Host key (Right Ctrl by default) releases the grab.
+
+# The guest has no `.git` (rsync excludes it), so stamp the host revision here
+# and hand it to the build provisioner for BUILD_INFO.
+build_rev = `git -C "#{File.dirname(__FILE__)}" rev-parse --short HEAD 2>/dev/null`.strip
+build_rev = "unknown" if build_rev.empty?
 
 Vagrant.configure("2") do |config|
   # generic/arch, not archlinux/archlinux: the official box stopped shipping
@@ -23,14 +29,13 @@ Vagrant.configure("2") do |config|
   config.vm.box = "generic/arch"
   config.vm.hostname = "icedtea-vm"
 
-  # rsync (one-way, host -> guest) instead of vboxsf: cargo builds on a
-  # vboxsf mount are slow and flaky, and the guest owning its own copy under
-  # ~vagrant keeps target/ native. Re-push edits with `vagrant rsync` or keep
-  # `vagrant rsync-auto` running.
+  # rsync (one-way, host -> guest). `session/`, the unit files and the
+  # wallpaper asset ride this same tree: provisioning installs them from the
+  # guest's copy, so the VM's session is always the checked-in one.
   config.vm.synced_folder ".", "/home/vagrant/icedtea-wm",
     type: "rsync",
     rsync__args: ["--archive", "--delete"],
-    rsync__exclude: [".git/", "target/", ".remember/", ".superpowers/", ".claude/"]
+    rsync__exclude: [".git/", "target/", ".remember/", ".superpowers/", ".claude/", ".vagrant/", ".worktrees/"]
 
   config.vm.provider "virtualbox" do |vb|
     vb.name = "icedtea-wm"
@@ -42,10 +47,12 @@ Vagrant.configure("2") do |config|
     vb.customize ["modifyvm", :id, "--accelerate-3d", "on"]
   end
 
-  # Root phase: packages, seatd, groups, autologin, helper script.
+  # Root phase: packages, seatd, groups, session units/asset, wdm.
   config.vm.provision "system", type: "shell", path: "vagrant/provision-system.sh"
 
-  # User phase: rust toolchain + first build, as the vagrant user.
+  # User phase: rust toolchain + release build, as the vagrant user. The host
+  # revision rides the provisioner environment down to BUILD_INFO.
   config.vm.provision "build", type: "shell",
-    path: "vagrant/provision-build.sh", privileged: false
+    path: "vagrant/provision-build.sh", privileged: false,
+    env: { "ICEDTEA_BUILD_REV" => build_rev }
 end

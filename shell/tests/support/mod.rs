@@ -581,23 +581,32 @@ impl Panel {
     #[must_use]
     pub fn labels_under(&self, container: &str, prefix: &str) -> Vec<String> {
         let (cx, cy, cw, ch) = self.allocation(container);
-        // Latest wins per id: the append-only report carries an id once per
-        // frame it changed in, so a plain scan would list it as many times as
-        // it moved. The last line for an id is the box it holds now.
-        let mut latest: std::collections::HashMap<String, (i32, i32)> =
-            std::collections::HashMap::new();
-        for line in self.report() {
+        // The report is a sequence of *complete* per-frame snapshots, each
+        // headed by its `frame N` line: `write_probe_report` dedups the whole
+        // line set, so a block is written only when it changed, but it
+        // contains every current id. Only the last block describes what is on
+        // screen now. Scanning earlier blocks (the previous "latest wins per
+        // id" walk) kept a removed id's stale box alive: a closed window's
+        // `alloc window_1` from the frame that first drew it survived, and
+        // once the surrounding layout shifted, that stale box could fall back
+        // inside `container` and be counted as a live child. Reading the last
+        // block only is what the absence assertions need.
+        let lines = self.report();
+        let start = lines
+            .iter()
+            .rposition(|l| l.starts_with("frame "))
+            .map_or(0, |i| i + 1);
+        let mut found: Vec<(i32, i32, String)> = Vec::new();
+        for line in &lines[start..] {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() != 6 || f[0] != "alloc" || !f[1].starts_with(prefix) {
                 continue;
             }
-            latest.insert(f[1].to_string(), (parse_coord(f[2]), parse_coord(f[3])));
+            let (x, y) = (parse_coord(f[2]), parse_coord(f[3]));
+            if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
+                found.push((x, y, f[1].to_string()));
+            }
         }
-        let mut found: Vec<(i32, i32, String)> = latest
-            .into_iter()
-            .filter(|(_, (x, y))| *x >= cx && *x < cx + cw && *y >= cy && *y < cy + ch)
-            .map(|(id, (x, y))| (x, y, id))
-            .collect();
         if cw >= ch {
             found.sort_by_key(|(x, _, _)| *x);
         } else {

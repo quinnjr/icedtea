@@ -25,6 +25,37 @@ use icedtea_contract::SeqEvent;
 
 use state::State;
 
+/// Where the session's default wallpaper is installed. Provisioning copies
+/// `session/assets/default-wallpaper.png` here; tests and unusual installs
+/// override it with `ICEDTEA_DEFAULT_WALLPAPER`.
+pub const DEFAULT_WALLPAPER_PATH: &str = "/usr/share/icedtea/default-wallpaper.png";
+
+/// Resolve which wallpaper to show: the configured path if set, else the
+/// `ICEDTEA_DEFAULT_WALLPAPER` override, else the installed default when it
+/// exists, else none (today's flat background).
+///
+/// A fresh install has `Appearance.wallpaper == None`; without this the
+/// desktop is a bare colour until someone opens settings and picks an image.
+///
+/// `pub(crate)` so the live-reload path resolves the same fallback the boot
+/// path does: clearing the configured wallpaper back to `None` must land on
+/// the installed default, not a flat background.
+pub(crate) fn resolve_wallpaper(
+    configured: Option<&str>,
+    env_override: Option<&std::ffi::OsStr>,
+    installed: &std::path::Path,
+) -> Option<String> {
+    if let Some(path) = configured {
+        return Some(path.to_string());
+    }
+    if let Some(path) = env_override {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    installed
+        .exists()
+        .then(|| installed.to_string_lossy().into_owned())
+}
+
 /// Boot and run the compositor.
 ///
 /// Ordering is load-bearing and each step says why:
@@ -132,10 +163,13 @@ pub fn run() {
     if let Err(err) = runtime.create_shortcuts_inhibit_manager(&display) {
         tracing::error!(%err, "shortcuts inhibition is unavailable");
     }
-    // Bridges tablet tools and pads to tablet-aware clients
-    // (`zwp_tablet_manager_v2`). Non-fatal: without it a tablet still moves
-    // the cursor (the crate attaches every input device to it, tablet
-    // included), but no client ever sees tool/pad traffic.
+    // Advertises tablet tools and pads to tablet-aware clients
+    // (`zwp_tablet_manager_v2`): protocol objects exist, but tool/pad
+    // EVENTS still need compositor-driven `wlr_send_tablet_v2_*` forwards
+    // (no safe wrapper yet), so clients see the devices, not their
+    // traffic. Non-fatal: without it a tablet still moves the cursor (the
+    // crate attaches every input device to it, tablet included), but no
+    // client ever sees tool/pad traffic.
     if let Err(err) = runtime.create_tablet_manager(&display) {
         tracing::error!(%err, "tablet input is unavailable");
     }
@@ -270,7 +304,11 @@ pub fn run() {
         cmd_wake_write,
     );
 
-    let wallpaper_path = state.config.appearance.wallpaper.clone();
+    let wallpaper_path = resolve_wallpaper(
+        state.config.appearance.wallpaper.as_deref(),
+        std::env::var_os("ICEDTEA_DEFAULT_WALLPAPER").as_deref(),
+        std::path::Path::new(DEFAULT_WALLPAPER_PATH),
+    );
     state.spawn_wallpaper(wallpaper_path);
 
     if let Err(err) = backend.run_all(&display, &mut state, &runtime, wlr::Until::Stop) {
@@ -392,5 +430,50 @@ pub fn create_compat_globals(
     }
     if let Err(err) = runtime.create_power_manager(display) {
         tracing::error!(%err, "output power management unavailable; clients cannot request power modes");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn wallpaper_resolution_prefers_config_then_env_then_installed() {
+        let dir = std::env::temp_dir().join(format!(
+            "icedtea-wall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let installed = dir.join("default.png");
+        std::fs::write(&installed, b"x").expect("asset");
+
+        assert_eq!(
+            super::resolve_wallpaper(
+                Some("/custom.png"),
+                Some(std::ffi::OsStr::new("/env.png")),
+                &installed
+            ),
+            Some("/custom.png".to_string()),
+            "a configured wallpaper always wins"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, Some(std::ffi::OsStr::new("/env.png")), &installed),
+            Some("/env.png".to_string()),
+            "the env override beats the installed default"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, None, &installed),
+            Some(installed.to_string_lossy().into_owned()),
+            "an existing installed default is used when config and env are unset"
+        );
+        assert_eq!(
+            super::resolve_wallpaper(None, None, &dir.join("missing.png")),
+            None,
+            "no installed default means no wallpaper (the flat background)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

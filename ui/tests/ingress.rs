@@ -625,15 +625,11 @@ fn pointer_handlers_fire_down_motion_up_in_order_with_local_coordinates() {
             Cmd::None
         },
         |_m: &()| -> View<String> {
-            // `width_request`/`height_request`, not `hexpand`/`vexpand`:
-            // reconciliation — `hexpand`/`vexpand` round-trip through `Props`
-            // (`ui/src/view/mod.rs`) but nothing in the generic layout path
-            // reads either name (only `action_bar`/`center_box`/`header_bar`/
-            // `paned`/`overlay`/`state` set a `ChildLayout` for their own
-            // children, and this canvas is the window's sole top-level
-            // child); an explicit floor sized to the surface centers to the
-            // same (0, 0) origin `hexpand`/`vexpand` would fill to, without
-            // depending on the missing wiring.
+            // `width_request`/`height_request` give this sole top-level child
+            // a definite size at the surface origin. `hexpand`/`vexpand` are
+            // honored on a plain child now, so either would size it the same
+            // way; the explicit floor keeps the canvas's geometry independent
+            // of the window's own alignment defaults.
             box_(Orientation::Vertical, [label("canvas")])
                 .width_request(200)
                 .height_request(100)
