@@ -5,7 +5,7 @@
 **Parent:** `2026-08-20-icedtea-de-roadmap.md`.
 **Decisions of record:** DE startup moves into the repo as systemd `--user`
 units (approach A); readiness by a repo-owned wait helper, not `Type=notify`;
-the compositor is `RequiredBy` the session target and the other five units are
+the session target `Requires` the compositor and the other five units are
 `Wants` (best-effort); the wallpaper falls back to an installed default asset
 rather than seeding the VM's redb config; the panel clock ticks from a
 shell-side timer thread, not a new toolkit wake API; one time crate is added
@@ -105,7 +105,7 @@ systemd user unit files, and a small wait helper.
 
 | Unit | Needs | Ordering / dependency |
 |---|---|---|
-| `icedtea-compositor.service` | seat + DRM | `RequiredBy=icedtea-session.target`; owns `wayland-0` and `org.icedtea.Compositor` |
+| `icedtea-compositor.service` | seat + DRM | `Requires=`d by the target; owns `wayland-0` and `org.icedtea.Compositor` |
 | `icedtea-wayland-env.service` | compositor socket | oneshot, `After` compositor; waits for the socket and publishes `WAYLAND_DISPLAY` through the user manager (see readiness) |
 | `icedtea-notifications.service` | session bus | `Wants`; independent of Wayland, claims `org.freedesktop.Notifications` |
 | `icedtea-clipboard.service` | compositor socket, bus | `After`/`Wants` `icedtea-wayland-env`; `ExecStartPre` waits for a bus name where needed |
@@ -114,8 +114,8 @@ systemd user unit files, and a small wait helper.
 | `icedtea-session.target` | — | `Wants=` the six; the single entry point |
 
 Every unit is `Type=simple` (the oneshot publisher excepted), `Restart=on-failure`
-with a bounded `StartLimitBurst`, and logs to the journal. The compositor being
-`RequiredBy` the target is deliberate: a desktop without a compositor is not a
+with a bounded `StartLimitBurst`, and logs to the journal. The target
+`Requires`ing the compositor is deliberate: a desktop without a compositor is not a
 degraded session, it is no session, so its exit stops the target and its own
 restart policy drives recovery. The other units are `Wants` so that a crashing
 shell cannot take the compositor (and with it the session) down.
@@ -187,9 +187,10 @@ rendering by a unit written for VirtualBox.
 The compositor gains a **default-wallpaper fallback**: when
 `Appearance.wallpaper` is `None`, it resolves, in order, an env override
 (`ICEDTEA_DEFAULT_WALLPAPER`) and then an installed path
-(`/usr/share/icedtea/default-wallpaper.png`), and uses the first that exists.
-An explicit config value always wins, and a `None` config with no installed
-default keeps today's flat background.
+(`/usr/share/icedtea/default-wallpaper.png`); a configured path always wins,
+the env override wins unconditionally when config is unset, and the installed
+path is used only when it exists. A `None` config with no installed default
+keeps today's flat background.
 
 This is chosen over seeding the guest's redb config because it fixes the
 first-run desktop for *every* install (VM and bare metal) instead of making
@@ -270,7 +271,7 @@ generated, redistributable image kept in the repo.
 |---|---|---|
 | D1 | systemd `--user` units, not a shell script | Matches how real DEs start; gives ordering, bounded restart, and journal logs — the "trust" half — and is the same artifact on bare metal |
 | D2 | Readiness by `icedtea-wait` helper + an env-publisher unit, not `Type=notify` | No libsystemd dependency, no compositor change; the helper also covers bus-name waits the current script fakes with `sleep`, and publishing `WAYLAND_DISPLAY` is the only way separate client units can learn a runtime-chosen socket name |
-| D3 | compositor `RequiredBy` target; others `Wants` | No compositor means no session; a broken shell must not kill the compositor |
+| D3 | target `Requires` the compositor; others `Wants` | No compositor means no session; a broken shell must not kill the compositor |
 | D4 | Wallpaper: installed default + fallback, not redb seeding | Fixes every fresh install, keeps appearance out of VM-only setup |
 | D5 | Clock: shell timer thread, not toolkit `next_wake()` | Smallest change; reuses existing worker/wake patterns; no toolkit surface change |
 | D6 | Add one time crate for local-time formatting | The workspace has none; local time (not UTC) is required for a desktop clock |

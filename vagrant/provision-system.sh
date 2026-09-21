@@ -12,14 +12,28 @@ pacman -Su --noconfirm
 # wlroots0.20 matches the `wlr = "0.20"` crate's pkg-config requirement
 # (wlroots-0.20.pc). clang is for wlr-sys's bindgen; foot is a Wayland
 # terminal to open test windows inside the compositor.
+#
+# wdm (the box's display manager) is deliberately NOT in this list: the
+# generic/arch snapshot ships it, and it is not in `core`/`extra` by name, so
+# a `pacman -S wdm-wayland` would abort this whole phase. It is checked for
+# below and its absence is a clear, early failure.
 pacman -S --noconfirm --needed \
   base-devel git rustup clang pkgconf \
   wlroots0.20 wayland wayland-protocols \
   libinput libxkbcommon pixman libdrm mesa \
   seatd xorg-xwayland polkit \
   gtk4 gtk4-layer-shell dbus \
-  foot \
-  wdm-wayland wdm-greeter wdm-webkit-greeter
+  foot
+
+# The display manager is preinstalled box state, not something this script
+# installs (it is not resolvable from `core`/`extra`). Fail early and clearly
+# if it is missing, rather than half-provisioning a box with no login path.
+if ! command -v wdm >/dev/null 2>&1; then
+  echo "provision-system: wdm is not installed on this box; it ships with the" >&2
+  echo "generic/arch snapshot and is not in core/extra. Install it before" >&2
+  echo "provisioning, or the VM has no login path." >&2
+  exit 1
+fi
 
 # wlroots takes the session through libseat -> seatd; the vagrant user needs
 # the seat group for that, plus video/input for the DRM and evdev nodes.

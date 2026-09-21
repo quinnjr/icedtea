@@ -828,11 +828,27 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                         props_of(&child).get(PropName::Vexpand).is_some()
                     };
                     if on {
-                        // `on == true` starts from the *unaligned* centring
-                        // when the child has no layout of its own, so the
+                        // Start from the *unaligned* centring when the child
+                        // has no `Hexpand`/`Vexpand` prop of its own, so the
                         // forced axis grows without the other stretching --
-                        // the same coupling the universal arms avoid.
-                        //
+                        // the same coupling the universal arms avoid. Read the
+                        // tree only when the child *did* ask (`asked`), since
+                        // an unasked child may carry a synthetic `Fill` left by
+                        // a previous `homogeneous == false` pass; forcing from
+                        // it would stretch the cross axis, where a box built
+                        // homogeneous from the start centres it.
+                        let mut cl = if asked {
+                            tree.child_layout(&child).unwrap_or_default()
+                        } else {
+                            centred_child_layout()
+                        };
+                        if horizontal {
+                            cl.hexpand = true;
+                        } else {
+                            cl.vexpand = true;
+                        }
+                        tree.set_child_layout(&child, cl);
+                    } else if !asked {
                         // `homogeneous == false` deliberately keeps the
                         // historical `Fill` base (`unwrap_or_default`): it is
                         // the pass that *releases* a `GtkBox:homogeneous`
@@ -843,16 +859,6 @@ pub fn flush_layout(tree: &mut crate::layout::LayoutTree) {
                         // alignment axes are left as the tree already has
                         // them. A child carrying its own prop is skipped
                         // entirely and left to the universal pass.
-                        let mut cl = tree
-                            .child_layout(&child)
-                            .unwrap_or_else(centred_child_layout);
-                        if horizontal {
-                            cl.hexpand = true;
-                        } else {
-                            cl.vexpand = true;
-                        }
-                        tree.set_child_layout(&child, cl);
-                    } else if !asked {
                         let mut cl = tree.child_layout(&child).unwrap_or_default();
                         if horizontal {
                             cl.hexpand = false;
